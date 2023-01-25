@@ -1,9 +1,6 @@
-from botocore.vendored import requests
-import logging
 import json
-import time
-import datetime
-import os
+
+from botocore.vendored import requests
 
 
 def slack_post(event):

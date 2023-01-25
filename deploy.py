@@ -6,10 +6,25 @@ import boto3
 
 
 def run():
-    # regions = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'sa-east-1', 'eu-west-1', 'eu-west-2',
-    #            'eu-west-3', 'eu-central-1', 'ca-central-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-southeast-1',
-    #            'ap-southeast-2', 'ap-south-1']
-    regions = ["us-east-1"]
+    regions = [
+        "ap-south-1",
+        "eu-north-1",
+        "eu-west-3",
+        "eu-west-2",
+        "eu-west-1",
+        "ap-northeast-3",
+        "ap-northeast-2",
+        "ap-northeast-1",
+        "ca-central-1",
+        "sa-east-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "eu-central-1",
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+    ]
     output_filename = "GDPatrol"
     with open("role_policy.json") as rp:
         assume_role_policy = rp.read()
@@ -79,7 +94,7 @@ def run():
             MemorySize=128,
         )
         target_arn = lambda_response["FunctionArn"]
-        target_id = "Id" + str(randrange(10**11, 10**12))
+        target_id = "Id" + str(randrange(10 ** 11, 10 ** 12))
 
         # Remove targets and delete the CloudWatch rule before recreating it
         rules = cw_events.list_rules(NamePrefix="GDPatrol")["Rules"]
@@ -99,7 +114,7 @@ def run():
         )
 
         # We are adding the trigger to the Lambda function so that it will be invoked every time  a finding is sent over
-        statement_id = str(randrange(10**11, 10**12))
+        statement_id = str(randrange(10 ** 11, 10 ** 12))
         lmb.add_permission(
             FunctionName=lambda_response["FunctionName"],
             StatementId=statement_id,
