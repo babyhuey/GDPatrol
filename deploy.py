@@ -6,20 +6,20 @@ import boto3
 
 
 def run():
-    # REGIONS = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'sa-east-1', 'eu-west-1', 'eu-west-2',
+    # regions = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'sa-east-1', 'eu-west-1', 'eu-west-2',
     #            'eu-west-3', 'eu-central-1', 'ca-central-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-southeast-1',
     #            'ap-southeast-2', 'ap-south-1']
-    REGIONS = ["us-east-1"]
-    OUTPUT_FILENAME = "GDPatrol"
+    regions = ["us-east-1"]
+    output_filename = "GDPatrol"
     with open("role_policy.json") as rp:
         assume_role_policy = rp.read()
-    zipped = make_archive(OUTPUT_FILENAME, "zip", root_dir="GDPatrol")
+    zipped = make_archive(output_filename, "zip", root_dir="GDPatrol")
 
     with open("lambda_policy.json") as lp:
         lambda_policy = lp.read()
 
     iam = boto3.client("iam")
-    # delete the role if it already exists so it can be deployed with
+    # delete the role if it already exists, so it can be deployed with
     # the latest configuration
     roles = iam.list_roles()["Roles"]
     for role in roles:
@@ -40,7 +40,7 @@ def run():
         PolicyDocument=lambda_policy,
     )
 
-    for region in REGIONS:
+    for region in regions:
 
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
@@ -67,7 +67,7 @@ def run():
             pass
         lambda_response = lmb.create_function(
             FunctionName="GDPatrol",
-            Runtime="python3.6",
+            Runtime="python3.9",
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
             Layers=[
