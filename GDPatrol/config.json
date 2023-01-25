@@ -169,7 +169,7 @@
       {
         "type": "UnauthorizedAccess:EC2/SSHBruteForce",
         "actions": ["blacklist_ip"],
-        "reliability": 5
+        "reliability": 10
       },
       {
         "type": "UnauthorizedAccess:EC2/TorIPCaller",
