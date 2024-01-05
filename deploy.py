@@ -8,9 +8,8 @@ import boto3
 def run():
     regions = []
     ec2 = boto3.client("ec2")
-    response = ec2.describe_regions(
-        RegionNames=["us-east-1"]
-    )
+    sts = boto3.client("sts")
+    response = ec2.describe_regions()
     for i in response["Regions"]:
         regions.append(i["RegionName"])
 
@@ -25,14 +24,15 @@ def run():
     iam = boto3.client("iam")
     # delete the role if it already exists, so it can be deployed with
     # the latest configuration
-    
-    roles = iam.list_roles(MaxItems=1000)["Roles"]
-    for role in roles:
-        if role["RoleName"] == "GDPatrolRole":
-            iam.delete_role_policy(
-                RoleName="GDPatrolRole", PolicyName="GDPatrol_lambda_policy"
-            )
-            iam.delete_role(RoleName="GDPatrolRole")
+        
+    for response in iam.get_paginator('list_roles').paginate():
+        for role in response['Roles']:
+            if role["RoleName"] == "GDPatrolRole":
+                iam.delete_role_policy(
+                    RoleName="GDPatrolRole", 
+                    PolicyName="GDPatrol_lambda_policy"
+                )
+                iam.delete_role(RoleName="GDPatrolRole")
 
     created_role = iam.create_role(
         RoleName="GDPatrolRole", AssumeRolePolicyDocument=assume_role_policy
@@ -46,20 +46,18 @@ def run():
     )
 
     for region in regions:
-        print(region)
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
         gd = boto3.client("guardduty", region_name=region)
-        print(gd.list_detectors()["DetectorIds"])
         if not gd.list_detectors()["DetectorIds"]:
             created_detector = gd.create_detector(Enable=True)
             print(
                 "Created GuardDuty detector: {}".format(created_detector["DetectorId"])
             )
         else:
-            gd.update_detector(
-                DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
-            )
+            # gd.update_detector(
+            #     DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
+            # )
             print(
                 "Detector already exists: {}".format(
                     gd.list_detectors()["DetectorIds"][0]
@@ -77,8 +75,7 @@ def run():
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
             Layers=[
-                'arn:aws:lambda:us-east-1:965962280944:layer:slack:1',
-                # "arn:aws:lambda:us-east-1:930246233938:layer:slack:1",
+                f"arn:aws:lambda:us-east-1:{sts.get_caller_identity()['Account']}:layer:slack:1"
             ],
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
@@ -143,10 +140,7 @@ def run():
                         'KeyType': 'RANGE',
                     },
                 ],
-                ProvisionedThroughput={
-                    'ReadCapacityUnits': 5,
-                    'WriteCapacityUnits': 5,
-                },
+                BillingMode='PAY_PER_REQUEST',
                 TableName='GDPatrol',
             )
         except dynamodb_client.exceptions.ResourceInUseException:
