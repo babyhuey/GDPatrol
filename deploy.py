@@ -8,7 +8,9 @@ import boto3
 def run():
     regions = []
     ec2 = boto3.client("ec2")
-    response = ec2.describe_regions()
+    response = ec2.describe_regions(
+        RegionNames=["us-east-1"]
+    )
     for i in response["Regions"]:
         regions.append(i["RegionName"])
 
@@ -23,7 +25,8 @@ def run():
     iam = boto3.client("iam")
     # delete the role if it already exists, so it can be deployed with
     # the latest configuration
-    roles = iam.list_roles()["Roles"]
+    
+    roles = iam.list_roles(MaxItems=1000)["Roles"]
     for role in roles:
         if role["RoleName"] == "GDPatrolRole":
             iam.delete_role_policy(
@@ -43,10 +46,11 @@ def run():
     )
 
     for region in regions:
-
+        print(region)
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
         gd = boto3.client("guardduty", region_name=region)
+        print(gd.list_detectors()["DetectorIds"])
         if not gd.list_detectors()["DetectorIds"]:
             created_detector = gd.create_detector(Enable=True)
             print(
@@ -73,8 +77,8 @@ def run():
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
             Layers=[
-                # 'arn:aws:lambda:us-east-1:965962280944:layer:slack:1',
-                "arn:aws:lambda:us-east-1:930246233938:layer:slack:1",
+                'arn:aws:lambda:us-east-1:965962280944:layer:slack:1',
+                # "arn:aws:lambda:us-east-1:930246233938:layer:slack:1",
             ],
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
@@ -114,6 +118,41 @@ def run():
                 str(region)
             )
         )
+
+        # Create DynamoDB table if not existed
+        dynamodb_client = boto3.client('dynamodb')
+        try:
+            response = dynamodb_client.create_table(
+                AttributeDefinitions=[
+                    {
+                        'AttributeName': 'network_acl_id',
+                        'AttributeType': 'S',
+                    },
+                    {
+                        'AttributeName': 'created_at',
+                        'AttributeType': 'S',
+                    },
+                ],
+                KeySchema=[
+                    {
+                        'AttributeName': 'network_acl_id',
+                        'KeyType': 'HASH',
+                    },
+                    {
+                        'AttributeName': 'created_at',
+                        'KeyType': 'RANGE',
+                    },
+                ],
+                ProvisionedThroughput={
+                    'ReadCapacityUnits': 5,
+                    'WriteCapacityUnits': 5,
+                },
+                TableName='GDPatrol',
+            )
+        except dynamodb_client.exceptions.ResourceInUseException:
+            pass
+
+
     remove(zipped)
 
 
