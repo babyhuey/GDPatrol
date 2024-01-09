@@ -467,6 +467,8 @@ def lambda_handler(event, context):
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = asg_detach_instance(instance_id)
                 successful_actions += int(result)
+        elif action == "log_context":
+            logger.info(context)
 
     event_description = event["description"]
     event_account = event["accountId"]

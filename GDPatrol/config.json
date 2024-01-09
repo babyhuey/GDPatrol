@@ -337,6 +337,78 @@
           "disable_account"
         ],
         "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/AnomalousBehavior.SuccessfulLogin",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/AnomalousBehavior.FailedLogin",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/AnomalousBehavior.SuccessfulBruteForce",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/MaliciousIPCaller.SuccessfulLogin",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/TorIPCaller.SuccessfulLogin",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:RDS/TorIPCaller.FailedLogin",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:RDS/TorIPCaller",
+        "actions": [
+          "blacklist_ip",
+          "log_context"
+        ],
+        "reliability": 5
       }
     ]
   }
