@@ -23,6 +23,7 @@ st = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def blacklist_ip(ip_address):
+    import os
     try:
         client = boto3.client("ec2")
         dynamodb_client = boto3.client('dynamodb')
@@ -77,7 +78,7 @@ def blacklist_ip(ip_address):
                 logger.info(f"deleting network_acl rule_number = {oldest_item['rule_number']['S']}")
                 client.delete_network_acl_entry(
                     Egress=False,
-                    DryRun=True,
+                    DryRun=os.environ['DELETE_NACL_ENTRY_DRY_RUN'],
                     NetworkAclId=nacl["NetworkAclId"],
                     RuleNumber=int(oldest_item["rule_number"]['S'])
                 )

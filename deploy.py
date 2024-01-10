@@ -80,6 +80,11 @@ def run():
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
             MemorySize=128,
+            Environment={
+                'Variables': {
+                    'DELETE_NACL_ENTRY_DRY_RUN': 'False'
+                }
+            },
         )
         target_arn = lambda_response["FunctionArn"]
         target_id = "Id" + str(randrange(10**11, 10**12))
