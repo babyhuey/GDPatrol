@@ -1,7 +1,7 @@
 from os import remove
 from random import randrange
 from shutil import make_archive
-
+from time import sleep
 import boto3
 
 
@@ -69,9 +69,10 @@ def run():
             lmb.delete_function(FunctionName="GDPatrol")
         except:
             pass
+        sleep(7) # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
         lambda_response = lmb.create_function(
             FunctionName="GDPatrol",
-            Runtime="python3.9",
+            Runtime="python3.11",
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
             Layers=[

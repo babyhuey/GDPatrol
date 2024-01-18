@@ -78,7 +78,7 @@ def blacklist_ip(ip_address):
                 logger.info(f"deleting network_acl rule_number = {oldest_item['rule_number']['S']}")
                 client.delete_network_acl_entry(
                     Egress=False,
-                    DryRun=os.environ['DELETE_NACL_ENTRY_DRY_RUN'],
+                    DryRun=eval(os.environ['DELETE_NACL_ENTRY_DRY_RUN']),
                     NetworkAclId=nacl["NetworkAclId"],
                     RuleNumber=int(oldest_item["rule_number"]['S'])
                 )
