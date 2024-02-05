@@ -36,66 +36,60 @@ def blacklist_ip(ip_address):
                 raise Exception("Rule number is less than 1")
             target_rule_number = min_rule_id - 1
 
-            # Add ip_address to entry nacl
-            try:
-                r = client.create_network_acl_entry(
-                    CidrBlock=f"{ip_address}/32",
-                    Egress=False,
-                    NetworkAclId=nacl["NetworkAclId"],
-                    Protocol="-1",
-                    RuleAction="deny",
-                    RuleNumber=target_rule_number,
-                )
-                logger.info(f"created network_acl rule_number = {target_rule_number}")
-            except Exception:
-                response = dynamodb_client.query(
-                    TableName="GDPatrol",
-                    KeyConditionExpression='#pk = :pk_value',
-                    ExpressionAttributeNames={'#pk': 'network_acl_id'},
-                    ExpressionAttributeValues={':pk_value': {'S': nacl["NetworkAclId"]}}
-                )
-                oldest_item = response["Items"][0]
-
+            while True:
+                logger.info(nacl["NetworkAclId"])
                 try:
-                    logger.info(f"deleting network_acl rule_number = {oldest_item['rule_number']['S']}")
-                    client.delete_network_acl_entry(
+                    r = client.create_network_acl_entry(
+                        CidrBlock=f"{ip_address}/32",
                         Egress=False,
-                        DryRun=eval(os.environ['DELETE_NACL_ENTRY_DRY_RUN']),
                         NetworkAclId=nacl["NetworkAclId"],
-                        RuleNumber=int(oldest_item["rule_number"]['S'])
+                        Protocol="-1",
+                        RuleAction="deny",
+                        RuleNumber=target_rule_number,
                     )
-                    logger.info(f"deleted network_acl rule_number = {oldest_item['rule_number']['S']}")
-
-                    dynamodb_client.delete_item(
-                        TableName="GDPatrol",
-                        Key={
-                            'network_acl_id': oldest_item["network_acl_id"], 
-                            'created_at': oldest_item["created_at"]
-                        }
-                    )
+                    logger.info(f"created network_acl rule_number = {target_rule_number}")
                 except Exception as e:
-                    logger.error(f"can't delete the item from table: {e}")
+                    logger.info(e)
+                    response = dynamodb_client.query(
+                        TableName="GDPatrol",
+                        KeyConditionExpression='#pk = :pk_value',
+                        ExpressionAttributeNames={'#pk': 'network_acl_id'},
+                        ExpressionAttributeValues={':pk_value': {'S': nacl["NetworkAclId"]}}
+                    )
+                    oldest_item = response["Items"][0]
 
-                client.create_network_acl_entry(
-                    CidrBlock=f"{ip_address}/32",
-                    Egress=False,
-                    NetworkAclId=nacl["NetworkAclId"],
-                    Protocol="-1",
-                    RuleAction="deny",
-                    RuleNumber=target_rule_number,
-                )
-                logger.info(f"created network_acl rule_number = {target_rule_number}")
+                    try:
+                        logger.info(f"deleting network_acl rule_number = {oldest_item['rule_number']['S']}")
+                        client.delete_network_acl_entry(
+                            Egress=False,
+                            DryRun=eval(os.environ['DELETE_NACL_ENTRY_DRY_RUN']),
+                            NetworkAclId=nacl["NetworkAclId"],
+                            RuleNumber=int(oldest_item["rule_number"]['S'])
+                        )
+                        logger.info(f"deleted network_acl rule_number = {oldest_item['rule_number']['S']}")
 
-                # Add target rule_number to DynamoDB table
-                dynamodb_client.put_item(
-                    TableName='GDPatrol', 
-                    Item={
-                        'network_acl_id' :{'S': nacl["NetworkAclId"]},
-                        'created_at': {'S': str(ts)},
-                        'rule_number': {'S': str(target_rule_number)}
-                    }
-                )
-                logger.info(f"added rule_number = {target_rule_number} to dynamodb table")
+                        dynamodb_client.delete_item(
+                            TableName="GDPatrol",
+                            Key={
+                                'network_acl_id': oldest_item["network_acl_id"], 
+                                'created_at': oldest_item["created_at"]
+                            }
+                        )
+                    except Exception as e:
+                        logger.error(f"can't delete the item from table: {e}")
+                    continue
+                break
+
+            # Add target rule_number to DynamoDB table
+            dynamodb_client.put_item(
+                TableName='GDPatrol', 
+                Item={
+                    'network_acl_id' :{'S': nacl["NetworkAclId"]},
+                    'created_at': {'S': str(ts)},
+                    'rule_number': {'S': str(target_rule_number)}
+                }
+            )
+            logger.info(f"added rule_number = {target_rule_number} to dynamodb table")
                 
             logger.info(
                 "GDPatrol: Successfully executed action {} for ".format(
