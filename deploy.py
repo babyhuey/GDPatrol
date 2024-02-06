@@ -12,6 +12,7 @@ def run():
     response = ec2.describe_regions()
     for i in response["Regions"]:
         regions.append(i["RegionName"])
+
     output_filename = "GDPatrol"
     with open("role_policy.json") as rp:
         assume_role_policy = rp.read()
