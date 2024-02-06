@@ -30,7 +30,7 @@ def blacklist_ip(ip_address):
         nacls = client.describe_network_acls()
         for nacl in nacls["NetworkAcls"]:
             min_rule_id = min(
-                rule["RuleNumber"] for rule in nacl["Entries"] if not rule["Egress"]
+                rule["RuleNumber"] for rule in nacl["Entries"] if not rule["Egress"] and rule["RuleAction"] == "deny"
             )
             if min_rule_id < 1:
                 raise Exception("Rule number is less than 1")
