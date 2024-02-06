@@ -37,7 +37,7 @@ def blacklist_ip(ip_address):
             target_rule_number = min_rule_id - 1
 
             while True:
-                logger.info(nacl["NetworkAclId"])
+                # Add ip_address to entry nacl
                 try:
                     r = client.create_network_acl_entry(
                         CidrBlock=f"{ip_address}/32",
