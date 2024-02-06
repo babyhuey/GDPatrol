@@ -48,7 +48,7 @@ def blacklist_ip(ip_address):
                         RuleNumber=target_rule_number,
                     )
                     logger.info(f"created network_acl rule_number = {target_rule_number}")
-                except Exception as e:
+                except Exception:
                     response = dynamodb_client.query(
                         TableName="GDPatrol",
                         KeyConditionExpression='#pk = :pk_value',
