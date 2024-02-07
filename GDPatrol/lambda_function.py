@@ -49,7 +49,7 @@ def blacklist_ip(ip_address):
                     )
                     logger.info(f"created network_acl rule_number = {target_rule_number}")
                 except Exception:
-                    logger.info(f"Exception: {error.response['Error']['Code']}")
+                    logger.info(f"INFO: {error.response['Error']['Code']}")
                     if error.response['Error']['Code'] == 'NetworkAclEntryLimitExceeded':
                         response = dynamodb_client.query(
                             TableName="GDPatrol",
