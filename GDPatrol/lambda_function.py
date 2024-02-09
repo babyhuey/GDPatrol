@@ -77,7 +77,7 @@ def blacklist_ip(ip_address):
                             )
                         except Exception as e:
                             logger.error(f"can't delete the item from table: {e}")
-                        continue
+                    continue
                 break
 
             # Add target rule_number to DynamoDB table
