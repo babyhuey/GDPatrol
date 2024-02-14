@@ -24,13 +24,45 @@ st = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 def blacklist_ip(ip_address):
     import os
+
     try:
         client = boto3.client("ec2")
-        dynamodb_client = boto3.client('dynamodb')
+        dynamodb_client = boto3.client("dynamodb")
         nacls = client.describe_network_acls()
+
+        lock_id = "lock"
+        max_retries = 5
+        lock_table_name = "GDPatrol_lock"
+
+        # Ensure lock table exists
+        create_lock_table()
+
+        for attempt in range(max_retries):
+            try:
+                response = dynamodb_client.get_item(
+                    TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
+                )
+                if "Item" in response:
+                    time.sleep(2)
+                    continue
+
+                dynamodb_client.put_item(
+                    TableName=lock_table_name,
+                    Item={"lock_id": {"S": lock_id}, "timestamp": {"S": str(ts)}},
+                    ConditionExpression="attribute_not_exists(lock_id)",
+                )
+                break
+            except dynamodb_client.exceptions.ConditionalCheckFailedException:
+                time.sleep(2)
+
+        if attempt == max_retries - 1:
+            raise Exception("Unable to acquire lock after multiple attempts")
+
         for nacl in nacls["NetworkAcls"]:
             min_rule_id = min(
-                rule["RuleNumber"] for rule in nacl["Entries"] if not rule["Egress"]
+                rule["RuleNumber"]
+                for rule in nacl["Entries"]
+                if not rule["Egress"] and rule["RuleAction"] == "deny"
             )
             if min_rule_id < 1:
                 raise Exception("Rule number is less than 1")
@@ -47,64 +79,69 @@ def blacklist_ip(ip_address):
                     RuleNumber=target_rule_number,
                 )
                 logger.info(f"created network_acl rule_number = {target_rule_number}")
-            except Exception:
-                response = dynamodb_client.query(
-                    TableName="GDPatrol",
-                    KeyConditionExpression='#pk = :pk_value',
-                    ExpressionAttributeNames={'#pk': 'network_acl_id'},
-                    ExpressionAttributeValues={':pk_value': {'S': nacl["NetworkAclId"]}}
-                )
-                oldest_item = response["Items"][0]
-
-                try:
-                    logger.info(f"deleting network_acl rule_number = {oldest_item['rule_number']['S']}")
-                    client.delete_network_acl_entry(
-                        Egress=False,
-                        DryRun=eval(os.environ['DELETE_NACL_ENTRY_DRY_RUN']),
-                        NetworkAclId=nacl["NetworkAclId"],
-                        RuleNumber=int(oldest_item["rule_number"]['S'])
-                    )
-                    logger.info(f"deleted network_acl rule_number = {oldest_item['rule_number']['S']}")
-
-                    dynamodb_client.delete_item(
+            except Exception as error:
+                logger.info(f"INFO: {error.response['Error']['Code']}")
+                if error.response["Error"]["Code"] == "NetworkAclEntryLimitExceeded":
+                    response = dynamodb_client.query(
                         TableName="GDPatrol",
-                        Key={
-                            'network_acl_id': oldest_item["network_acl_id"], 
-                            'created_at': oldest_item["created_at"]
-                        }
+                        KeyConditionExpression="#pk = :pk_value",
+                        ExpressionAttributeNames={"#pk": "network_acl_id"},
+                        ExpressionAttributeValues={
+                            ":pk_value": {"S": nacl["NetworkAclId"]}
+                        },
                     )
-                except Exception as e:
-                    logger.error(f"can't delete the item from table: {e}")
+                    oldest_item = response["Items"][0]
+                    try:
+                        logger.info(nacl["NetworkAclId"])
+                        logger.info(
+                            f"deleting network_acl rule_number = {oldest_item['rule_number']['S']}"
+                        )
+                        client.delete_network_acl_entry(
+                            Egress=False,
+                            DryRun=eval(os.environ["DELETE_NACL_ENTRY_DRY_RUN"]),
+                            NetworkAclId=nacl["NetworkAclId"],
+                            RuleNumber=int(oldest_item["rule_number"]["S"]),
+                        )
+                        logger.info(
+                            f"deleted network_acl rule_number = {oldest_item['rule_number']['S']}"
+                        )
 
-                client.create_network_acl_entry(
-                    CidrBlock=f"{ip_address}/32",
-                    Egress=False,
-                    NetworkAclId=nacl["NetworkAclId"],
-                    Protocol="-1",
-                    RuleAction="deny",
-                    RuleNumber=target_rule_number,
-                )
-                logger.info(f"created network_acl rule_number = {target_rule_number}")
+                        dynamodb_client.delete_item(
+                            TableName="GDPatrol",
+                            Key={
+                                "network_acl_id": oldest_item["network_acl_id"],
+                                "created_at": oldest_item["created_at"],
+                            },
+                        )
+                    except Exception as e:
+                        logger.error(f"can't delete the item from table: {e}")
+                continue
+            break
 
-                # Add target rule_number to DynamoDB table
-                dynamodb_client.put_item(
-                    TableName='GDPatrol', 
-                    Item={
-                        'network_acl_id' :{'S': nacl["NetworkAclId"]},
-                        'created_at': {'S': str(ts)},
-                        'rule_number': {'S': str(target_rule_number)}
-                    }
-                )
-                logger.info(f"added rule_number = {target_rule_number} to dynamodb table")
-                
+            # Add target rule_number to DynamoDB table
+            dynamodb_client.put_item(
+                TableName="GDPatrol",
+                Item={
+                    "network_acl_id": {"S": nacl["NetworkAclId"]},
+                    "created_at": {"S": str(ts)},
+                    "rule_number": {"S": str(target_rule_number)},
+                },
+            )
+            logger.info(f"added rule_number = {target_rule_number} to dynamodb table")
+
             logger.info(
                 "GDPatrol: Successfully executed action {} for ".format(
                     stack()[0][3], ip_address
                 )
             )
+        dynamodb_client.delete_item(
+            TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
+        )
+
         return True
     except Exception as e:
-        logger.error(f"GDPatrol: Error executing {stack()[0][3]} - {e}")
+        logger.error(f"GDPatrol: Error executing blacklist_ip - {e}")
+        return False
 
 
 def whitelist_ip(ip_address):
@@ -532,3 +569,31 @@ def lambda_handler(event, context):
             finding_type,
         )
     )
+
+
+def create_lock_table():
+    dynamodb = boto3.resource("dynamodb")
+    table_name = "GDPatrol_lock"
+
+    # Check if the table already exists
+    try:
+        table = dynamodb.Table(table_name)
+        if table.table_status in ["CREATING", "UPDATING", "DELETING", "ACTIVE"]:
+            logger.info(f"Table '{table_name}' already exists.")
+            return
+    except dynamodb.meta.client.exceptions.ResourceNotFoundException:
+        pass  # Table does not exist, proceed with creation
+
+    # Create the table
+    table = dynamodb.create_table(
+        TableName=table_name,
+        KeySchema=[{"AttributeName": "lock_id", "KeyType": "HASH"}],  # Partition key
+        AttributeDefinitions=[
+            {"AttributeName": "lock_id", "AttributeType": "S"}  # String
+        ],
+        ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+    )
+
+    # Wait until the table exists, this will block until the table is created
+    table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
+    logger.info(f"Table '{table_name}' created successfully.")

@@ -24,13 +24,12 @@ def run():
     iam = boto3.client("iam")
     # delete the role if it already exists, so it can be deployed with
     # the latest configuration
-        
-    for response in iam.get_paginator('list_roles').paginate():
-        for role in response['Roles']:
+
+    for response in iam.get_paginator("list_roles").paginate():
+        for role in response["Roles"]:
             if role["RoleName"] == "GDPatrolRole":
                 iam.delete_role_policy(
-                    RoleName="GDPatrolRole", 
-                    PolicyName="GDPatrol_lambda_policy"
+                    RoleName="GDPatrolRole", PolicyName="GDPatrol_lambda_policy"
                 )
                 iam.delete_role(RoleName="GDPatrolRole")
 
@@ -55,9 +54,9 @@ def run():
                 "Created GuardDuty detector: {}".format(created_detector["DetectorId"])
             )
         else:
-            # gd.update_detector(
-            #     DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
-            # )
+            gd.update_detector(
+                DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
+            )
             print(
                 "Detector already exists: {}".format(
                     gd.list_detectors()["DetectorIds"][0]
@@ -69,23 +68,21 @@ def run():
             lmb.delete_function(FunctionName="GDPatrol")
         except:
             pass
-        sleep(7) # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
+        sleep(7)
+        # Lambda bug: create function right after the
+        # role deleted will cause AccessDeniedExceptionKMS error
         lambda_response = lmb.create_function(
             FunctionName="GDPatrol",
             Runtime="python3.11",
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
-            Layers=[
-                f"arn:aws:lambda:us-east-1:{sts.get_caller_identity()['Account']}:layer:slack:1"
-            ],
+            # Layers=[
+            #     f"arn:aws:lambda:{region}:{sts.get_caller_identity()['Account']}:layer:slack:1"
+            # ],
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
             MemorySize=128,
-            Environment={
-                'Variables': {
-                    'DELETE_NACL_ENTRY_DRY_RUN': 'False'
-                }
-            },
+            Environment={"Variables": {"DELETE_NACL_ENTRY_DRY_RUN": "False"}},
         )
         target_arn = lambda_response["FunctionArn"]
         target_id = "Id" + str(randrange(10**11, 10**12))
@@ -123,35 +120,34 @@ def run():
         )
 
         # Create DynamoDB table if not existed
-        dynamodb_client = boto3.client('dynamodb')
+        dynamodb_client = boto3.client("dynamodb")
         try:
             response = dynamodb_client.create_table(
                 AttributeDefinitions=[
                     {
-                        'AttributeName': 'network_acl_id',
-                        'AttributeType': 'S',
+                        "AttributeName": "network_acl_id",
+                        "AttributeType": "S",
                     },
                     {
-                        'AttributeName': 'created_at',
-                        'AttributeType': 'S',
+                        "AttributeName": "created_at",
+                        "AttributeType": "S",
                     },
                 ],
                 KeySchema=[
                     {
-                        'AttributeName': 'network_acl_id',
-                        'KeyType': 'HASH',
+                        "AttributeName": "network_acl_id",
+                        "KeyType": "HASH",
                     },
                     {
-                        'AttributeName': 'created_at',
-                        'KeyType': 'RANGE',
+                        "AttributeName": "created_at",
+                        "KeyType": "RANGE",
                     },
                 ],
-                BillingMode='PAY_PER_REQUEST',
-                TableName='GDPatrol',
+                BillingMode="PAY_PER_REQUEST",
+                TableName="GDPatrol",
             )
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
-
 
     remove(zipped)
 
