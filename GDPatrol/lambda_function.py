@@ -157,9 +157,7 @@ def whitelist_ip(ip_address):
                         RuleNumber=rule["RuleNumber"],
                     )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], ip_address
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}"
         )
         return True
 
@@ -197,9 +195,7 @@ def quarantine_instance(instance_id, vpc_id):
         client.modify_instance_attribute(InstanceId=instance_id, Groups=[sg_id])
 
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], instance_id
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}"
         )
         return True
     except Exception as e:
@@ -220,9 +216,7 @@ def snapshot_instance(instance_id):
                 Description=f"Created by GDpatrol for {instance_id}",
             )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], instance_id
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}"
         )
         return True
     except Exception as e:
@@ -241,9 +235,7 @@ def disable_account(username):
             '"Resource":"*"}}',
         )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], username
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {username}"
         )
         return True
     except Exception as e:
@@ -262,9 +254,7 @@ def disable_ec2_access(username):
             '"Resource":"*"}}',
         )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], username
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {username}"
         )
         return True
     except Exception as e:
@@ -280,9 +270,7 @@ def enable_ec2_access(username):
             PolicyName="BlockEC2Policy",
         )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], username
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {username}"
         )
         return True
     except Exception as e:
@@ -305,9 +293,7 @@ def disable_sg_access(username):
             '"Resource":"*"}}',
         )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], username
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {username}"
         )
         return True
     except Exception as e:
@@ -323,9 +309,7 @@ def enable_sg_access(username):
             PolicyName="BlockSecurityGroupPolicy",
         )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], username
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {username}"
         )
         return True
     except Exception as e:
@@ -351,9 +335,7 @@ def asg_detach_instance(instance_id):
                 ShouldDecrementDesiredCapacity=False,
             )
         logger.info(
-            "GDPatrol: Successfully executed action {} for {}".format(
-                stack()[0][3], instance_id
-            )
+            f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}"
         )
         return True
     except Exception as e:
@@ -391,9 +373,7 @@ def lambda_handler(event, context):
         finding_id = event["id"]
         finding_type = event["type"]
         logger.info(
-            "GDPatrol: Parsed Finding ID: {} - Finding Type: {}".format(
-                finding_id, finding_type
-            )
+            f"GDPatrol: Parsed Finding ID: {finding_id} - Finding Type: {finding_type}"
         )
         config = Config(event["type"])
         severity = int(event["severity"])

@@ -50,18 +50,12 @@ def run():
         gd = boto3.client("guardduty", region_name=region)
         if not gd.list_detectors()["DetectorIds"]:
             created_detector = gd.create_detector(Enable=True)
-            print(
-                "Created GuardDuty detector: {}".format(created_detector["DetectorId"])
-            )
+            print((f"Created GuardDuty detector: {created_detector['DetectorId']}"))
         else:
             gd.update_detector(
                 DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
             )
-            print(
-                "Detector already exists: {}".format(
-                    gd.list_detectors()["DetectorIds"][0]
-                )
-            )
+            print((f"Detector already exists: {gd.list_detectors()['DetectorIds'][0]}"))
 
         try:
             lmb.get_function(FunctionName="GDPatrol")
@@ -114,8 +108,10 @@ def run():
             SourceArn=created_rule["RuleArn"],
         )
         print(
-            "Successfully deployed the GDPatrol lambda function in region {}.".format(
-                str(region)
+            (
+                "Successfully deployed the GDPatrol lambda function in region {}.".format(
+                    str(region)
+                )
             )
         )
 
