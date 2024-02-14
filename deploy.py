@@ -8,7 +8,6 @@ import boto3
 def run():
     regions = []
     ec2 = boto3.client("ec2")
-    sts = boto3.client("sts")
     response = ec2.describe_regions()
     for i in response["Regions"]:
         regions.append(i["RegionName"])
@@ -50,17 +49,17 @@ def run():
         gd = boto3.client("guardduty", region_name=region)
         if not gd.list_detectors()["DetectorIds"]:
             created_detector = gd.create_detector(Enable=True)
-            print((f"Created GuardDuty detector: {created_detector['DetectorId']}"))
+            print(f"Created GuardDuty detector: {created_detector['DetectorId']}")
         else:
             gd.update_detector(
                 DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
             )
-            print((f"Detector already exists: {gd.list_detectors()['DetectorIds'][0]}"))
+            print(f"Detector already exists: {gd.list_detectors()['DetectorIds'][0]}")
 
         try:
             lmb.get_function(FunctionName="GDPatrol")
             lmb.delete_function(FunctionName="GDPatrol")
-        except:
+        except Exception:
             pass
         sleep(7)
         # Lambda bug: create function right after the
@@ -70,9 +69,6 @@ def run():
             Runtime="python3.11",
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
-            # Layers=[
-            #     f"arn:aws:lambda:{region}:{sts.get_caller_identity()['Account']}:layer:slack:1"
-            # ],
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
             MemorySize=128,

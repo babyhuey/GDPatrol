@@ -70,7 +70,7 @@ def blacklist_ip(ip_address):
 
             # Add ip_address to entry nacl
             try:
-                r = client.create_network_acl_entry(
+                client.create_network_acl_entry(
                     CidrBlock=f"{ip_address}/32",
                     Egress=False,
                     NetworkAclId=nacl["NetworkAclId"],
@@ -130,9 +130,7 @@ def blacklist_ip(ip_address):
             logger.info(f"added rule_number = {target_rule_number} to dynamodb table")
 
             logger.info(
-                "GDPatrol: Successfully executed action {} for ".format(
-                    stack()[0][3], ip_address
-                )
+                f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}"
             )
         dynamodb_client.delete_item(
             TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
@@ -211,7 +209,7 @@ def snapshot_instance(instance_id):
             "BlockDeviceMappings"
         ]
         for device in blockmappings:
-            snapshot = client.create_snapshot(
+            client.create_snapshot(
                 VolumeId=device["Ebs"]["VolumeId"],
                 Description=f"Created by GDpatrol for {instance_id}",
             )
@@ -384,7 +382,7 @@ def lambda_handler(event, context):
         resource_type = event["resource"]["resourceType"]
     except KeyError as e:
         logger.error(
-            "GDPatrol: Could not parse the Finding fields correctly, please verify that the JSON is correct"
+            f"GDPatrol: Could not parse the Finding fields correctly, please verify that the JSON is correct. {e}"
         )
         exit(1)
     if resource_type == "Instance":
@@ -498,7 +496,7 @@ def lambda_handler(event, context):
     event_first_seen = event["service"]["eventFirstSeen"]
     event_last_seen = event["service"]["eventLastSeen"]
     event_type = event["type"]
-    event_id = event["id"]
+    # event_id = event["id"]
 
     # Adding link to finding in the description
     event_description += "GDPatrol: Total actions: {} - Actions to be executed: {} - Successful Actions: {} - Finding ID:  {} - Finding Type: {}".format(
