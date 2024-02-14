@@ -10,9 +10,7 @@ import requests
 
 import boto3
 
-slack_web_hook_url = (
-    "https://hooks.slack.com/services/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"
-)
+slack_web_hook_url = os.environ.get("slack_web_hook_url")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)

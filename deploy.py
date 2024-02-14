@@ -3,6 +3,7 @@ from random import randrange
 from shutil import make_archive
 from time import sleep
 import boto3
+import shutil
 
 
 def run():
@@ -15,8 +16,24 @@ def run():
     output_filename = "GDPatrol"
     with open("role_policy.json") as rp:
         assume_role_policy = rp.read()
-    zipped = make_archive(output_filename, "zip", root_dir="GDPatrol")
 
+    shutil.copytree("GDPatrol/", "GDPatrol-build/")
+    import sys
+    import subprocess
+
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "requests",
+            "--target",
+            "GDPatrol-build",
+        ]
+    )
+    zipped = make_archive(output_filename, "zip", root_dir="GDPatrol-build")
+    shutil.rmtree("GDPatrol-build")
     with open("lambda_policy.json") as lp:
         lambda_policy = lp.read()
 
@@ -51,9 +68,6 @@ def run():
             created_detector = gd.create_detector(Enable=True)
             print(f"Created GuardDuty detector: {created_detector['DetectorId']}")
         else:
-            gd.update_detector(
-                DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
-            )
             print(f"Detector already exists: {gd.list_detectors()['DetectorIds'][0]}")
 
         try:
@@ -61,7 +75,7 @@ def run():
             lmb.delete_function(FunctionName="GDPatrol")
         except Exception:
             pass
-        sleep(7)
+        sleep(2)
         # Lambda bug: create function right after the
         # role deleted will cause AccessDeniedExceptionKMS error
         lambda_response = lmb.create_function(
@@ -105,9 +119,7 @@ def run():
         )
         print(
             (
-                "Successfully deployed the GDPatrol lambda function in region {}.".format(
-                    str(region)
-                )
+                f"Successfully deployed the GDPatrol lambda function in region {str(region)}."
             )
         )
 
