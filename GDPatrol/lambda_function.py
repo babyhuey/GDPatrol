@@ -6,7 +6,9 @@ import time
 import uuid
 from inspect import stack
 from socket import gaierror, gethostbyname
+from typing import Any, Dict, List, Optional, Union
 import requests
+import ipaddress
 
 import boto3
 
@@ -18,17 +20,62 @@ logger.setLevel(logging.INFO)
 # Initialize boto3 clients at the top of the script
 ec2_client = boto3.client("ec2")
 dynamodb_client = boto3.client("dynamodb")
+bedrock_client = boto3.client("bedrock-runtime")
 
 # Grabbing the current timestamp for the footer
 ts = time.time()
 st = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def publish_message(slack_web_hook_url, data):
-    requests.post(slack_web_hook_url, data=data, timeout=30)
+def enhance_message_with_claude(message_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enhance the message using Claude Sonnet on AWS Bedrock.
+    """
+    try:
+        prompt = f"""You are a security expert analyzing a GuardDuty finding. Please analyze this security alert and provide:
+1. A clear, human-friendly explanation of what this alert means
+2. The potential impact and severity of this threat
+3. Specific recommendations for investigation and remediation
+4. Any additional context that would be helpful for the security team
+
+Here is the alert data:
+{json.dumps(message_data, indent=2)}
+
+Please format your response in a clear, structured way that would be helpful for a security team to understand and act upon."""
+
+        response = bedrock_client.invoke_model(
+            modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+            body=json.dumps(
+                {
+                    "prompt": prompt,
+                    "max_tokens": 1000,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                }
+            ),
+        )
+
+        response_body = json.loads(response.get("body").read())
+        enhanced_message = response_body.get("completion", "")
+
+        # Add the enhanced message to the description
+        message_data["attachments"][0]["fields"].append(
+            {"title": "AI Analysis", "value": enhanced_message, "short": False}
+        )
+
+        return message_data
+    except Exception as e:
+        logger.error(f"Error enhancing message with Claude: {e}")
+        return message_data
 
 
-def create_network_acl_entry(ip_address, nacl_id, rule_number):
+def publish_message(slack_web_hook_url: str, data: str) -> None:
+    """Publish a message to Slack with AI-enhanced analysis."""
+    enhanced_data = enhance_message_with_claude(json.loads(data))
+    requests.post(slack_web_hook_url, data=json.dumps(enhanced_data), timeout=30)
+
+
+def create_network_acl_entry(ip_address: str, nacl_id: str, rule_number: int) -> None:
     """
     Create a network ACL entry to block the specified IP address.
     """
@@ -47,7 +94,7 @@ def create_network_acl_entry(ip_address, nacl_id, rule_number):
         raise
 
 
-def delete_oldest_acl_entry(nacl_id):
+def delete_oldest_acl_entry(nacl_id: str) -> None:
     """
     Delete the oldest ACL entry for a given Network ACL ID.
     """
@@ -85,7 +132,9 @@ def delete_oldest_acl_entry(nacl_id):
         raise
 
 
-def acquire_lock(lock_table_name, lock_id, max_retries=5, retry_delay=2):
+def acquire_lock(
+    lock_table_name: str, lock_id: str, max_retries: int = 5, retry_delay: int = 2
+) -> None:
     """
     Acquire a lock from a DynamoDB table.
     """
@@ -113,7 +162,7 @@ def acquire_lock(lock_table_name, lock_id, max_retries=5, retry_delay=2):
     raise Exception("Unable to acquire lock after multiple attempts")
 
 
-def release_lock(lock_table_name, lock_id):
+def release_lock(lock_table_name: str, lock_id: str) -> None:
     """
     Release a lock in a DynamoDB table.
     """
@@ -122,43 +171,97 @@ def release_lock(lock_table_name, lock_id):
     )
 
 
-def blacklist_ip(ip_address, lock_table_name="GDPatrol_lock", lock_id="lock"):
+def blacklist_ip(
+    ip_address: str, lock_table_name: str = "GDPatrol_lock", lock_id: str = "lock"
+) -> bool:
     """
     Blacklist an IP address by adding it to the network ACLs.
     """
     try:
+        # Validate IP address
+        try:
+            ipaddress.ip_address(ip_address)
+        except ValueError:
+            logger.error(f"Invalid IP address: {ip_address}")
+            return False
+
         acquire_lock(lock_table_name, lock_id)
         nacls = ec2_client.describe_network_acls()
 
         for nacl in nacls["NetworkAcls"]:
-            min_rule_id = min(
-                rule["RuleNumber"]
+            # Get all deny rules for this NACL
+            deny_rules = [
+                rule
                 for rule in nacl["Entries"]
                 if not rule["Egress"] and rule["RuleAction"] == "deny"
-            )
-            if min_rule_id <= 1:
-                logger.error("Rule number is less than or equal to 1")
-                continue
+            ]
 
-            target_rule_number = min_rule_id - 1
+            if not deny_rules:
+                # If no deny rules exist, start with rule number 100
+                target_rule_number = 100
+            else:
+                # Find the minimum rule number among deny rules
+                min_rule_id = min(rule["RuleNumber"] for rule in deny_rules)
+                if min_rule_id <= 1:
+                    logger.error("Rule number is less than or equal to 1")
+                    continue
+                target_rule_number = min_rule_id - 1
+
             try:
                 create_network_acl_entry(
                     ip_address, nacl["NetworkAclId"], target_rule_number
                 )
+
+                # Store the new entry in DynamoDB
+                dynamodb_client.put_item(
+                    TableName="GDPatrol",
+                    Item={
+                        "network_acl_id": {"S": nacl["NetworkAclId"]},
+                        "created_at": {"S": str(time.time())},
+                        "rule_number": {"S": str(target_rule_number)},
+                    },
+                )
+
+                logger.info(f"Successfully blacklisted IP: {ip_address}")
+                return True
+
             except Exception as error:
                 logger.info(f"INFO: {error}")
                 if "NetworkAclEntryLimitExceeded" in str(error):
-                    delete_oldest_acl_entry(nacl["NetworkAclId"])
+                    try:
+                        delete_oldest_acl_entry(nacl["NetworkAclId"])
+                        # Retry creating the entry after deleting the oldest one
+                        create_network_acl_entry(
+                            ip_address, nacl["NetworkAclId"], target_rule_number
+                        )
+
+                        # Store the new entry in DynamoDB
+                        dynamodb_client.put_item(
+                            TableName="GDPatrol",
+                            Item={
+                                "network_acl_id": {"S": nacl["NetworkAclId"]},
+                                "created_at": {"S": str(time.time())},
+                                "rule_number": {"S": str(target_rule_number)},
+                            },
+                        )
+
+                        logger.info(
+                            f"Successfully blacklisted IP: {ip_address} after deleting oldest entry"
+                        )
+                        return True
+                    except Exception as retry_error:
+                        logger.error(
+                            f"Failed to create entry after deleting oldest: {retry_error}"
+                        )
+                        continue
                 continue
 
-            logger.info(f"Successfully blacklisted IP: {ip_address}")
-            break
     except Exception as e:
         logger.error(f"Error executing blacklist_ip: {e}")
         return False
     finally:
         release_lock(lock_table_name, lock_id)
-    return True
+    return False
 
 
 def whitelist_ip(ip_address):
@@ -361,32 +464,31 @@ def asg_detach_instance(instance_id):
 
 
 class Config:
-    def __init__(self, finding_type):
+    def __init__(self, finding_type: str) -> None:
         self.finding_type = finding_type
-        self.actions = []
-        self.reliability = 0
+        with open("config.json") as f:
+            self.config = json.load(f)
 
-    def get_actions(self):
-        with open("config.json") as config:
-            jsonloads = json.loads(config.read())
-            for item in jsonloads["playbooks"]["playbook"]:
-                if item["type"] == self.finding_type:
-                    self.actions = item["actions"]
-                    return self.actions
+    def get_actions(self) -> List[str]:
+        for playbook in self.config["playbooks"]["playbook"]:
+            if playbook["type"] == self.finding_type:
+                return (
+                    playbook["actions"]
+                    if isinstance(playbook["actions"], list)
+                    else [playbook["actions"]]
+                )
+        return []
 
-    def get_reliability(self):
-        with open("config.json") as config:
-            jsonloads = json.loads(config.read())
-            for item in jsonloads["playbooks"]["playbook"]:
-                if item["type"] == self.finding_type:
-                    self.reliability = int(item["reliability"])
-                    return self.reliability
+    def get_reliability(self) -> int:
+        for playbook in self.config["playbooks"]["playbook"]:
+            if playbook["type"] == self.finding_type:
+                return playbook["reliability"]
+        return 5
 
 
-def lambda_handler(event, context):
+def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     logger.info(f"GDPatrol: Received JSON event - {event}")
     try:
-
         finding_id = event["id"]
         finding_type = event["type"]
         logger.info(

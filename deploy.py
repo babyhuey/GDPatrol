@@ -1,25 +1,24 @@
 from os import remove
 from random import randrange
-from shutil import make_archive
+from shutil import make_archive, copytree, rmtree
 from time import sleep
 import boto3
-import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 
 def run():
     regions = []
     ec2 = boto3.client("ec2")
     response = ec2.describe_regions()
-    for i in response["Regions"]:
-        regions.append(i["RegionName"])
+    regions = [region["RegionName"] for region in response["Regions"]]
 
     output_filename = "GDPatrol"
     with open("role_policy.json") as rp:
         assume_role_policy = rp.read()
 
-    shutil.copytree("GDPatrol/", "GDPatrol-build/")
-    import sys
-    import subprocess
+    copytree("GDPatrol/", "GDPatrol-build/", dirs_exist_ok=True)
 
     subprocess.check_call(
         [
@@ -27,13 +26,14 @@ def run():
             "-m",
             "pip",
             "install",
-            "requests",
+            "-r",
+            "requirements.txt",
             "--target",
             "GDPatrol-build",
         ]
     )
     zipped = make_archive(output_filename, "zip", root_dir="GDPatrol-build")
-    shutil.rmtree("GDPatrol-build")
+    rmtree("GDPatrol-build")
     with open("lambda_policy.json") as lp:
         lambda_policy = lp.read()
 
@@ -80,7 +80,7 @@ def run():
         # role deleted will cause AccessDeniedExceptionKMS error
         lambda_response = lmb.create_function(
             FunctionName="GDPatrol",
-            Runtime="python3.11",
+            Runtime="python3.12",
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
             Code={"ZipFile": open(zipped, "rb").read()},
@@ -89,7 +89,7 @@ def run():
             Environment={"Variables": {"DELETE_NACL_ENTRY_DRY_RUN": "False"}},
         )
         target_arn = lambda_response["FunctionArn"]
-        target_id = "Id" + str(randrange(10**11, 10**12))
+        target_id = f"Id{randrange(10**11, 10**12)}"
 
         # Remove targets and delete the CloudWatch rule before recreating it
         rules = cw_events.list_rules(NamePrefix="GDPatrol")["Rules"]
@@ -117,11 +117,7 @@ def run():
             Principal="events.amazonaws.com",
             SourceArn=created_rule["RuleArn"],
         )
-        print(
-            (
-                f"Successfully deployed the GDPatrol lambda function in region {str(region)}."
-            )
-        )
+        print(f"Successfully deployed the GDPatrol lambda function in region {region}.")
 
         # Create DynamoDB table if not existed
         dynamodb_client = boto3.client("dynamodb")

@@ -50,6 +50,15 @@
         "dynamodb:*"
       ],
       "Resource": "arn:aws:dynamodb:*:*:table/GDPatrol"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+      ]
     }
   ]
 }
