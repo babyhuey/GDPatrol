@@ -6,9 +6,10 @@ import boto3
 import subprocess
 import sys
 from pathlib import Path
+import argparse
 
 
-def run():
+def run(slack_webhook_url=None):
     regions = []
     ec2 = boto3.client("ec2")
     response = ec2.describe_regions()
@@ -78,6 +79,9 @@ def run():
         sleep(2)
         # Lambda bug: create function right after the
         # role deleted will cause AccessDeniedExceptionKMS error
+        env_vars = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
+        if slack_webhook_url:
+            env_vars["SLACK_WEB_HOOK_URL"] = slack_webhook_url
         lambda_response = lmb.create_function(
             FunctionName="GDPatrol",
             Runtime="python3.12",
@@ -86,7 +90,7 @@ def run():
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
             MemorySize=128,
-            Environment={"Variables": {"DELETE_NACL_ENTRY_DRY_RUN": "False"}},
+            Environment={"Variables": env_vars},
         )
         target_arn = lambda_response["FunctionArn"]
         target_id = f"Id{randrange(10**11, 10**12)}"
@@ -153,4 +157,12 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Deploy GDPatrol Lambda function.")
+    parser.add_argument(
+        "--slack-webhook-url",
+        type=str,
+        help="Slack webhook URL to be set as an environment variable in the Lambda function.",
+        required=False,
+    )
+    args = parser.parse_args()
+    run(slack_webhook_url=args.slack_webhook_url)

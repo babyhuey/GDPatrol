@@ -12,7 +12,12 @@ import ipaddress
 
 import boto3
 
-slack_web_hook_url = os.environ.get("slack_web_hook_url")
+# Use uppercase for environment variable
+slack_web_hook_url = os.environ.get("SLACK_WEB_HOOK_URL")
+
+# Use environment variables for table names
+GD_PATROL_TABLE = os.environ.get("GD_PATROL_TABLE", "GDPatrol")
+GD_PATROL_LOCK_TABLE = os.environ.get("GD_PATROL_LOCK_TABLE", "GDPatrol_lock")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -71,8 +76,11 @@ Please format your response in a clear, structured way that would be helpful for
 
 def publish_message(slack_web_hook_url: str, data: str) -> None:
     """Publish a message to Slack with AI-enhanced analysis."""
-    enhanced_data = enhance_message_with_claude(json.loads(data))
-    requests.post(slack_web_hook_url, data=json.dumps(enhanced_data), timeout=30)
+    try:
+        enhanced_data = enhance_message_with_claude(json.loads(data))
+        requests.post(slack_web_hook_url, data=json.dumps(enhanced_data), timeout=30)
+    except Exception as e:
+        logger.error(f"Error publishing message to Slack: {e}")
 
 
 def create_network_acl_entry(ip_address: str, nacl_id: str, rule_number: int) -> None:
@@ -97,28 +105,49 @@ def create_network_acl_entry(ip_address: str, nacl_id: str, rule_number: int) ->
 def delete_oldest_acl_entry(nacl_id: str) -> None:
     """
     Delete the oldest ACL entry for a given Network ACL ID.
+    If DynamoDB is empty, fall back to enumerating actual NACL entries from AWS.
     """
     try:
         response = dynamodb_client.query(
-            TableName="GDPatrol",
+            TableName=GD_PATROL_TABLE,
             KeyConditionExpression="#pk = :pk_value",
             ExpressionAttributeNames={"#pk": "network_acl_id"},
             ExpressionAttributeValues={":pk_value": {"S": nacl_id}},
         )
-        oldest_item = response["Items"][0]
+        items = response.get("Items", [])
+        if not items:
+            logger.warning(f"No entries found in DynamoDB for NACL {nacl_id}. Falling back to AWS NACL entries.")
+            nacl = ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]
+            # Only consider deny, ingress rules (Egress=False, RuleAction='deny')
+            deny_rules = [rule for rule in nacl["Entries"] if not rule["Egress"] and rule["RuleAction"] == "deny"]
+            if not deny_rules:
+                logger.warning(f"No deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
+                return
+            # Find the oldest by lowest rule number
+            oldest_rule = min(deny_rules, key=lambda r: r["RuleNumber"])
+            logger.info(f"Deleting fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
+            ec2_client.delete_network_acl_entry(
+                Egress=False,
+                DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
+                NetworkAclId=nacl_id,
+                RuleNumber=oldest_rule["RuleNumber"],
+            )
+            logger.info(f"Deleted fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
+            return
+        oldest_item = items[0]
         logger.info(
             f"Deleting network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}"
         )
 
         ec2_client.delete_network_acl_entry(
             Egress=False,
-            DryRun=eval(os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False")),
+            DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
             NetworkAclId=nacl_id,
             RuleNumber=int(oldest_item["rule_number"]["S"]),
         )
 
         dynamodb_client.delete_item(
-            TableName="GDPatrol",
+            TableName=GD_PATROL_TABLE,
             Key={
                 "network_acl_id": {"S": nacl_id},
                 "created_at": {"S": oldest_item["created_at"]["S"]},
@@ -129,14 +158,14 @@ def delete_oldest_acl_entry(nacl_id: str) -> None:
         )
     except Exception as error:
         logger.error(f"Error deleting the oldest ACL entry: {error}")
-        raise
+        # Do not raise here; just log the error and continue
 
 
 def acquire_lock(
-    lock_table_name: str, lock_id: str, max_retries: int = 5, retry_delay: int = 2
+    lock_table_name: str, lock_id: str, max_retries: int = 5, retry_delay: int = 2, ttl_seconds: int = 60
 ) -> None:
     """
-    Acquire a lock from a DynamoDB table.
+    Acquire a lock from a DynamoDB table. Adds a TTL to avoid deadlocks.
     """
     for attempt in range(max_retries):
         try:
@@ -144,8 +173,16 @@ def acquire_lock(
                 TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
             )
             if "Item" in response:
-                time.sleep(retry_delay)
-                continue
+                # Check TTL
+                timestamp = int(response["Item"].get("timestamp", {"S": "0"})["S"])
+                if time.time() - timestamp > ttl_seconds:
+                    # Stale lock, delete it
+                    dynamodb_client.delete_item(
+                        TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
+                    )
+                else:
+                    time.sleep(retry_delay)
+                    continue
 
             dynamodb_client.put_item(
                 TableName=lock_table_name,
@@ -166,13 +203,16 @@ def release_lock(lock_table_name: str, lock_id: str) -> None:
     """
     Release a lock in a DynamoDB table.
     """
-    dynamodb_client.delete_item(
-        TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
-    )
+    try:
+        dynamodb_client.delete_item(
+            TableName=lock_table_name, Key={"lock_id": {"S": lock_id}}
+        )
+    except Exception as e:
+        logger.error(f"Error releasing lock: {e}")
 
 
 def blacklist_ip(
-    ip_address: str, lock_table_name: str = "GDPatrol_lock", lock_id: str = "lock"
+    ip_address: str, lock_table_name: str = None, lock_id: str = None
 ) -> bool:
     """
     Blacklist an IP address by adding it to the network ACLs.
@@ -185,10 +225,19 @@ def blacklist_ip(
             logger.error(f"Invalid IP address: {ip_address}")
             return False
 
+        # Use env table names if not provided
+        lock_table_name = lock_table_name or GD_PATROL_LOCK_TABLE
+        # Make lock_id resource-specific
+        lock_id = lock_id or f"lock-{ip_address}"
         acquire_lock(lock_table_name, lock_id)
-        nacls = ec2_client.describe_network_acls()
 
-        for nacl in nacls["NetworkAcls"]:
+        # Use paginator for NACLs
+        paginator = ec2_client.get_paginator("describe_network_acls")
+        nacls = []
+        for page in paginator.paginate():
+            nacls.extend(page["NetworkAcls"])
+
+        for nacl in nacls:
             # Get all deny rules for this NACL
             deny_rules = [
                 rule
@@ -214,7 +263,7 @@ def blacklist_ip(
 
                 # Store the new entry in DynamoDB
                 dynamodb_client.put_item(
-                    TableName="GDPatrol",
+                    TableName=GD_PATROL_TABLE,
                     Item={
                         "network_acl_id": {"S": nacl["NetworkAclId"]},
                         "created_at": {"S": str(time.time())},
@@ -234,17 +283,15 @@ def blacklist_ip(
                         create_network_acl_entry(
                             ip_address, nacl["NetworkAclId"], target_rule_number
                         )
-
                         # Store the new entry in DynamoDB
                         dynamodb_client.put_item(
-                            TableName="GDPatrol",
+                            TableName=GD_PATROL_TABLE,
                             Item={
                                 "network_acl_id": {"S": nacl["NetworkAclId"]},
                                 "created_at": {"S": str(time.time())},
                                 "rule_number": {"S": str(target_rule_number)},
                             },
                         )
-
                         logger.info(
                             f"Successfully blacklisted IP: {ip_address} after deleting oldest entry"
                         )
@@ -255,7 +302,6 @@ def blacklist_ip(
                         )
                         continue
                 continue
-
     except Exception as e:
         logger.error(f"Error executing blacklist_ip: {e}")
         return False
@@ -489,23 +535,26 @@ class Config:
 def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     logger.info(f"GDPatrol: Received JSON event - {event}")
     try:
-        finding_id = event["id"]
-        finding_type = event["type"]
+        finding_id = event.get("id")
+        finding_type = event.get("type")
+        if not finding_id or not finding_type:
+            logger.error("Missing required fields in event: 'id' or 'type'")
+            return
         logger.info(
             f"GDPatrol: Parsed Finding ID: {finding_id} - Finding Type: {finding_type}"
         )
         config = Config(event["type"])
-        severity = int(event["severity"])
-        count = event["service"]["count"]
+        severity = int(event.get("severity", 0))
+        count = event.get("service", {}).get("count", 0)
 
         config_actions = config.get_actions()
         config_reliability = config.get_reliability()
-        resource_type = event["resource"]["resourceType"]
+        resource_type = event.get("resource", {}).get("resourceType")
     except KeyError as e:
         logger.error(
             f"GDPatrol: Could not parse the Finding fields correctly, please verify that the JSON is correct. {e}"
         )
-        exit(1)
+        return
     if resource_type == "Instance":
         instance = event["resource"]["instanceDetails"]
         instance_id = instance["instanceId"]
@@ -513,20 +562,19 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     elif resource_type == "AccessKey":
         username = event["resource"]["accessKeyDetails"]["userName"]
 
-    if event["service"]["action"]["actionType"] == "DNS_REQUEST":
-        domain = event["service"]["action"]["dnsRequestAction"]["domain"]
-    elif event["service"]["action"]["actionType"] == "AWS_API_CALL":
-        ip_address = event["service"]["action"]["awsApiCallAction"]["remoteIpDetails"][
-            "ipAddressV4"
-        ]
-    elif event["service"]["action"]["actionType"] == "NETWORK_CONNECTION":
-        ip_address = event["service"]["action"]["networkConnectionAction"][
-            "remoteIpDetails"
-        ]["ipAddressV4"]
-    elif event["service"]["action"]["actionType"] == "PORT_PROBE":
-        ip_address = event["service"]["action"]["portProbeAction"]["portProbeDetails"][
-            0
-        ]["remoteIpDetails"]["ipAddressV4"]
+    action_type = event.get("service", {}).get("action", {}).get("actionType")
+    ip_address = None
+    domain = None
+    if action_type == "DNS_REQUEST":
+        domain = event["service"]["action"]["dnsRequestAction"].get("domain")
+    elif action_type == "AWS_API_CALL":
+        ip_address = event["service"]["action"]["awsApiCallAction"].get("remoteIpDetails", {}).get("ipAddressV4")
+    elif action_type == "NETWORK_CONNECTION":
+        ip_address = event["service"]["action"]["networkConnectionAction"].get("remoteIpDetails", {}).get("ipAddressV4")
+    elif action_type == "PORT_PROBE":
+        port_probe_details = event["service"]["action"]["portProbeAction"].get("portProbeDetails", [])
+        if port_probe_details:
+            ip_address = port_probe_details[0].get("remoteIpDetails", {}).get("ipAddressV4")
 
     successful_actions = 0
     total_config_actions = len(config_actions)
@@ -608,6 +656,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = asg_detach_instance(instance_id)
                 successful_actions += int(result)
+
+    logger.info(f"GDPatrol: Executed {successful_actions}/{actions_to_be_executed} actions successfully.")
 
     event_description = event["description"]
     event_account = event["accountId"]
