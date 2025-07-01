@@ -53,7 +53,7 @@ Please format your response in a clear, structured way that would be helpful for
             body=json.dumps(
                 {
                     "prompt": prompt,
-                    "max_tokens": 1000,
+                    "max_tokens_to_sample": 1000,
                     "temperature": 0.7,
                     "top_p": 0.9,
                 }
@@ -701,7 +701,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         ]
     }
     # slack.slack_post(event)
-    if event_severity >= 5:
+    if event_severity > 5:
         publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"

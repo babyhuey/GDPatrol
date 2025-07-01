@@ -60,6 +60,10 @@ def run(slack_webhook_url=None):
         PolicyName="GDPatrol_lambda_policy",
         PolicyDocument=lambda_policy,
     )
+    
+    # Wait for the role to be fully propagated
+    print("Waiting for IAM role to be fully propagated...")
+    sleep(10)
 
     for region in regions:
         lmb = boto3.client("lambda", region_name=region)
@@ -82,16 +86,25 @@ def run(slack_webhook_url=None):
         env_vars = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
         if slack_webhook_url:
             env_vars["SLACK_WEB_HOOK_URL"] = slack_webhook_url
-        lambda_response = lmb.create_function(
-            FunctionName="GDPatrol",
-            Runtime="python3.12",
-            Role=lambda_role_arn,
-            Handler="lambda_function.lambda_handler",
-            Code={"ZipFile": open(zipped, "rb").read()},
-            Timeout=300,
-            MemorySize=128,
-            Environment={"Variables": env_vars},
-        )
+        try:
+            lambda_response = lmb.create_function(
+                FunctionName="GDPatrol",
+                Runtime="python3.12",
+                Role=lambda_role_arn,
+                Handler="lambda_function.lambda_handler",
+                Code={"ZipFile": open(zipped, "rb").read()},
+                Timeout=300,
+                MemorySize=128,
+                Environment={"Variables": env_vars},
+            )
+        except Exception as e:
+            if "InvalidParameterValueException" in str(e) and "cannot be assumed by Lambda" in str(e):
+                print(f"Error: IAM role cannot be assumed by Lambda. This might be due to timing issues.")
+                print("Please wait a few minutes and try again, or check that the role has the correct trust policy.")
+                print(f"Role ARN: {lambda_role_arn}")
+                raise
+            else:
+                raise
         target_arn = lambda_response["FunctionArn"]
         target_id = f"Id{randrange(10**11, 10**12)}"
 
@@ -123,8 +136,10 @@ def run(slack_webhook_url=None):
         )
         print(f"Successfully deployed the GDPatrol lambda function in region {region}.")
 
-        # Create DynamoDB table if not existed
+        # Create DynamoDB tables if not existed
         dynamodb_client = boto3.client("dynamodb")
+        
+        # Create main GDPatrol table
         try:
             response = dynamodb_client.create_table(
                 AttributeDefinitions=[
@@ -150,6 +165,29 @@ def run(slack_webhook_url=None):
                 BillingMode="PAY_PER_REQUEST",
                 TableName="GDPatrol",
             )
+            print(f"Created DynamoDB table: GDPatrol")
+        except dynamodb_client.exceptions.ResourceInUseException:
+            pass
+        
+        # Create lock table
+        try:
+            response = dynamodb_client.create_table(
+                AttributeDefinitions=[
+                    {
+                        "AttributeName": "lock_id",
+                        "AttributeType": "S",
+                    },
+                ],
+                KeySchema=[
+                    {
+                        "AttributeName": "lock_id",
+                        "KeyType": "HASH",
+                    },
+                ],
+                BillingMode="PAY_PER_REQUEST",
+                TableName="GDPatrol_lock",
+            )
+            print(f"Created DynamoDB table: GDPatrol_lock")
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
 
