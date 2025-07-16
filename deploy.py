@@ -5,7 +5,6 @@ from time import sleep
 import boto3
 import subprocess
 import sys
-from pathlib import Path
 import argparse
 
 
@@ -99,7 +98,7 @@ def run(slack_webhook_url=None):
             )
         except Exception as e:
             if "InvalidParameterValueException" in str(e) and "cannot be assumed by Lambda" in str(e):
-                print(f"Error: IAM role cannot be assumed by Lambda. This might be due to timing issues.")
+                print("Error: IAM role cannot be assumed by Lambda. This might be due to timing issues.")
                 print("Please wait a few minutes and try again, or check that the role has the correct trust policy.")
                 print(f"Role ARN: {lambda_role_arn}")
                 raise
@@ -165,7 +164,7 @@ def run(slack_webhook_url=None):
                 BillingMode="PAY_PER_REQUEST",
                 TableName="GDPatrol",
             )
-            print(f"Created DynamoDB table: GDPatrol")
+            print("Created DynamoDB table: GDPatrol")
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
         
@@ -187,7 +186,7 @@ def run(slack_webhook_url=None):
                 BillingMode="PAY_PER_REQUEST",
                 TableName="GDPatrol_lock",
             )
-            print(f"Created DynamoDB table: GDPatrol_lock")
+            print("Created DynamoDB table: GDPatrol_lock")
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
 

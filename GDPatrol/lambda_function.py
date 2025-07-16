@@ -6,7 +6,7 @@ import time
 import uuid
 from inspect import stack
 from socket import gaierror, gethostbyname
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List
 import requests
 import ipaddress
 
