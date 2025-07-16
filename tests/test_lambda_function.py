@@ -1,8 +1,6 @@
 import pytest
 import json
 from unittest.mock import patch, MagicMock
-import boto3
-from moto import mock_aws
 import sys
 import os
 from pathlib import Path
@@ -10,12 +8,8 @@ from pathlib import Path
 # Add the parent directory to sys.path to import the lambda function
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from GDPatrol.lambda_function import (
-    enhance_message_with_claude,
     publish_message,
     create_network_acl_entry,
-    delete_oldest_acl_entry,
-    acquire_lock,
-    release_lock,
     blacklist_ip,
     Config,
     lambda_handler,
@@ -135,7 +129,7 @@ def test_blacklist_ip(mock_ec2_client, mock_dynamodb_client):
     """Test IP blacklisting functionality."""
     # Create test VPC and NACL
     vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
-    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
 
     # Create test DynamoDB tables
     mock_dynamodb_client.create_table(
@@ -172,7 +166,7 @@ def test_lambda_handler(
 
     # Create test VPC and NACL
     vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
-    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
 
     # Create test DynamoDB tables
     mock_dynamodb_client.create_table(
@@ -240,7 +234,7 @@ def test_blacklist_ip_parameterized(
     """Parameterized test for blacklist_ip function."""
     # Create test VPC and NACL
     vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
-    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
 
     # Create test DynamoDB tables
     mock_dynamodb_client.create_table(
