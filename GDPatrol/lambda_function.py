@@ -238,6 +238,17 @@ def blacklist_ip(
             nacls.extend(page["NetworkAcls"])
 
         for nacl in nacls:
+            # Check if IP is already blacklisted in this NACL
+            existing_rule = None
+            for rule in nacl["Entries"]:
+                if not rule["Egress"] and rule["RuleAction"] == "deny" and rule["CidrBlock"] == f"{ip_address}/32":
+                    existing_rule = rule
+                    break
+            
+            if existing_rule:
+                logger.info(f"IP {ip_address} is already blacklisted in NACL {nacl['NetworkAclId']} with rule {existing_rule['RuleNumber']}")
+                continue
+                
             # Get all deny rules for this NACL
             deny_rules = [
                 rule
@@ -245,14 +256,26 @@ def blacklist_ip(
                 if not rule["Egress"] and rule["RuleAction"] == "deny"
             ]
 
+            # Check if we're approaching the limit (max 20 rules per direction)
+            if len(deny_rules) >= 19:
+                logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, approaching limit of 20")
+                # Try to delete the oldest entry proactively
+                try:
+                    delete_oldest_acl_entry(nacl["NetworkAclId"])
+                    logger.info(f"Proactively deleted oldest entry from NACL {nacl['NetworkAclId']}")
+                except Exception as e:
+                    logger.error(f"Failed to proactively delete oldest entry: {e}")
+                    continue
+
             if not deny_rules:
                 # If no deny rules exist, start with rule number 100
                 target_rule_number = 100
             else:
                 # Find the minimum rule number among deny rules
                 min_rule_id = min(rule["RuleNumber"] for rule in deny_rules)
-                if min_rule_id <= 1:
-                    logger.error("Rule number is less than or equal to 1")
+                # Ensure we don't create rules with numbers <= 1
+                if min_rule_id <= 2:
+                    logger.error(f"Rule number {min_rule_id} is too low to create new rules")
                     continue
                 target_rule_number = min_rule_id - 1
 
@@ -278,6 +301,7 @@ def blacklist_ip(
                 logger.info(f"INFO: {error}")
                 if "NetworkAclEntryLimitExceeded" in str(error):
                     try:
+                        logger.info(f"Network ACL limit exceeded for {nacl['NetworkAclId']}, attempting to delete oldest entry")
                         delete_oldest_acl_entry(nacl["NetworkAclId"])
                         # Retry creating the entry after deleting the oldest one
                         create_network_acl_entry(
@@ -300,8 +324,11 @@ def blacklist_ip(
                         logger.error(
                             f"Failed to create entry after deleting oldest: {retry_error}"
                         )
-                        continue
-                continue
+                        # Try the next NACL instead of continuing with the same one
+                        break
+                else:
+                    logger.error(f"Error creating network_acl entry: {error}")
+                    continue
     except Exception as e:
         logger.error(f"Error executing blacklist_ip: {e}")
         return False
