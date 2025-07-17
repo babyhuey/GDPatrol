@@ -241,7 +241,9 @@ def blacklist_ip(
             # Check if IP is already blacklisted in this NACL
             existing_rule = None
             for rule in nacl["Entries"]:
-                if not rule["Egress"] and rule["RuleAction"] == "deny" and rule["CidrBlock"] == f"{ip_address}/32":
+                if (not rule["Egress"] and 
+                    rule["RuleAction"] == "deny" and 
+                    rule.get("CidrBlock") == f"{ip_address}/32"):
                     existing_rule = rule
                     break
             
@@ -343,7 +345,7 @@ def whitelist_ip(ip_address):
         nacls = client.describe_network_acls()
         for nacl in nacls["NetworkAcls"]:
             for rule in nacl["Entries"]:
-                if rule["CidrBlock"] == f"{ip_address}/32":
+                if rule.get("CidrBlock") == f"{ip_address}/32":
                     client.delete_network_acl_entry(
                         NetworkAclId=nacl["NetworkAclId"],
                         Egress=rule["Egress"],
