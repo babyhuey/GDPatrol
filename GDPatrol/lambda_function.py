@@ -260,14 +260,21 @@ def blacklist_ip(
 
             # Check if we're approaching the limit (max 20 rules per direction)
             if len(deny_rules) >= 19:
-                logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, approaching limit of 20")
-                # Try to delete the oldest entry proactively
-                try:
-                    delete_oldest_acl_entry(nacl["NetworkAclId"])
-                    logger.info(f"Proactively deleted oldest entry from NACL {nacl['NetworkAclId']}")
-                except Exception as e:
-                    logger.error(f"Failed to proactively delete oldest entry: {e}")
-                    continue
+                logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, performing aggressive cleanup.")
+                # Sort deny rules by RuleNumber descending (most recent/highest first)
+                deny_rules_sorted = sorted(deny_rules, key=lambda r: r["RuleNumber"], reverse=True)
+                # Keep only the 10 most recent/highest rule numbers
+                rules_to_delete = deny_rules_sorted[10:]
+                for rule in rules_to_delete:
+                    try:
+                        ec2_client.delete_network_acl_entry(
+                            Egress=False,
+                            NetworkAclId=nacl["NetworkAclId"],
+                            RuleNumber=rule["RuleNumber"],
+                        )
+                        logger.info(f"Aggressively deleted deny rule {rule['RuleNumber']} in NACL {nacl['NetworkAclId']}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete deny rule {rule['RuleNumber']}: {e}")
 
             if not deny_rules:
                 # If no deny rules exist, start with rule number 100
@@ -275,11 +282,25 @@ def blacklist_ip(
             else:
                 # Find the minimum rule number among deny rules
                 min_rule_id = min(rule["RuleNumber"] for rule in deny_rules)
-                # Ensure we don't create rules with numbers <= 1
+                # If we hit the lower bound, wrap around to a high rule number (e.g., 32700)
                 if min_rule_id <= 2:
-                    logger.error(f"Rule number {min_rule_id} is too low to create new rules")
-                    continue
-                target_rule_number = min_rule_id - 1
+                    logger.warning(f"Rule number {min_rule_id} is too low; wrapping to 32700 for NACL {nacl['NetworkAclId']}")
+                    target_rule_number = 32700
+                    # Delete any existing rule at 32700 before creating
+                    for rule in nacl["Entries"]:
+                        if not rule["Egress"] and rule["RuleAction"] == "deny" and rule["RuleNumber"] == 32700:
+                            try:
+                                ec2_client.delete_network_acl_entry(
+                                    Egress=False,
+                                    NetworkAclId=nacl["NetworkAclId"],
+                                    RuleNumber=32700,
+                                )
+                                logger.info(f"Deleted existing deny rule 32700 in NACL {nacl['NetworkAclId']}")
+                            except Exception as e:
+                                logger.error(f"Failed to delete existing rule 32700: {e}")
+                    # (Do not continue; proceed to create the new rule at 32700)
+                else:
+                    target_rule_number = min_rule_id - 1
 
             try:
                 create_network_acl_entry(

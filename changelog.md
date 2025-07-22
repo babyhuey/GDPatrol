@@ -29,3 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Environment variable handling in tests
 - Import issues with moto library
 - Configuration file handling in tests 
+
+### Security & Reliability Improvements
+- Aggressive NACL cleanup: when NACL deny rules approach the AWS limit, automatically delete all but the 10 most recent deny rules before adding a new one
+- Rule number wraparound: when rule numbers reach the lower bound, start over at 32700 and delete any existing rule at that number
+- Improved reliability for blacklisting IPs even when NACLs are near their entry limits
+- Enhanced logging for NACL cleanup and blacklisting actions 
