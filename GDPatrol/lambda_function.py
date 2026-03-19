@@ -49,11 +49,12 @@ Here is the alert data:
 Please format your response in a clear, structured way that would be helpful for a security team to understand and act upon."""
 
         response = bedrock_client.invoke_model(
-            modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+            modelId="anthropic.claude-sonnet-4-6-20250514-v1:0",
             body=json.dumps(
                 {
-                    "prompt": prompt,
-                    "max_tokens_to_sample": 1000,
+                    "anthropic_version": "bedrock-2023-05-31",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1000,
                     "temperature": 0.7,
                     "top_p": 0.9,
                 }
@@ -61,7 +62,7 @@ Please format your response in a clear, structured way that would be helpful for
         )
 
         response_body = json.loads(response.get("body").read())
-        enhanced_message = response_body.get("completion", "")
+        enhanced_message = response_body["content"][0]["text"]
 
         # Add the enhanced message to the description
         message_data["attachments"][0]["fields"].append(

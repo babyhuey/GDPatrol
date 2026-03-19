@@ -8,6 +8,20 @@ import sys
 import argparse
 
 
+def retry_with_backoff(fn, max_retries=5, initial_delay=2):
+    """Retry a function with exponential backoff."""
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            print(f"  Retrying in {delay}s ({e})...")
+            sleep(delay)
+            delay *= 2
+
+
 def run(slack_webhook_url=None):
     regions = []
     ec2 = boto3.client("ec2")
@@ -60,11 +74,8 @@ def run(slack_webhook_url=None):
         PolicyDocument=lambda_policy,
     )
     
-    # Wait for the role to be fully propagated
-    print("Waiting for IAM role to be fully propagated...")
-    sleep(10)
-
-    for region in regions:
+    total_regions = len(regions)
+    for i, region in enumerate(regions, 1):
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
         gd = boto3.client("guardduty", region_name=region)
@@ -79,14 +90,13 @@ def run(slack_webhook_url=None):
             lmb.delete_function(FunctionName="GDPatrol")
         except Exception:
             pass
-        sleep(2)
-        # Lambda bug: create function right after the
-        # role deleted will cause AccessDeniedExceptionKMS error
+
         env_vars = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
         if slack_webhook_url:
             env_vars["SLACK_WEB_HOOK_URL"] = slack_webhook_url
-        try:
-            lambda_response = lmb.create_function(
+
+        lambda_response = retry_with_backoff(
+            lambda: lmb.create_function(
                 FunctionName="GDPatrol",
                 Runtime="python3.12",
                 Role=lambda_role_arn,
@@ -96,14 +106,7 @@ def run(slack_webhook_url=None):
                 MemorySize=128,
                 Environment={"Variables": env_vars},
             )
-        except Exception as e:
-            if "InvalidParameterValueException" in str(e) and "cannot be assumed by Lambda" in str(e):
-                print("Error: IAM role cannot be assumed by Lambda. This might be due to timing issues.")
-                print("Please wait a few minutes and try again, or check that the role has the correct trust policy.")
-                print(f"Role ARN: {lambda_role_arn}")
-                raise
-            else:
-                raise
+        )
         target_arn = lambda_response["FunctionArn"]
         target_id = f"Id{randrange(10**11, 10**12)}"
 
@@ -133,7 +136,8 @@ def run(slack_webhook_url=None):
             Principal="events.amazonaws.com",
             SourceArn=created_rule["RuleArn"],
         )
-        print(f"Successfully deployed the GDPatrol lambda function in region {region}.")
+        remaining = total_regions - i
+        print(f"[{i}/{total_regions}] Deployed to {region}. {remaining} region{'s' if remaining != 1 else ''} remaining.")
 
         # Create DynamoDB tables if not existed
         dynamodb_client = boto3.client("dynamodb")
