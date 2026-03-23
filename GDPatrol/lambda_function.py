@@ -49,7 +49,7 @@ Here is the alert data:
 Please format your response in a clear, structured way that would be helpful for a security team to understand and act upon."""
 
         response = bedrock_client.invoke_model(
-            modelId="anthropic.claude-sonnet-4-6-20250514-v1:0",
+            modelId="anthropic.claude-sonnet-4-6",
             body=json.dumps(
                 {
                     "anthropic_version": "bedrock-2023-05-31",
@@ -626,6 +626,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         port_probe_details = event["service"]["action"]["portProbeAction"].get("portProbeDetails", [])
         if port_probe_details:
             ip_address = port_probe_details[0].get("remoteIpDetails", {}).get("ipAddressV4")
+    elif action_type == "RDS_LOGIN_ATTEMPT":
+        ip_address = event["service"]["action"]["rdsLoginAttemptAction"].get("remoteIpDetails", {}).get("ipAddressV4")
 
     successful_actions = 0
     total_config_actions = len(config_actions)

@@ -2,6 +2,8 @@ from os import remove
 from random import randrange
 from shutil import make_archive, copytree, rmtree
 from time import sleep
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import boto3
 import subprocess
 import sys
@@ -74,16 +76,20 @@ def run(slack_webhook_url=None):
         PolicyDocument=lambda_policy,
     )
     
+    zip_data = open(zipped, "rb").read()
+    completed = {"count": 0}
+    count_lock = threading.Lock()
     total_regions = len(regions)
-    for i, region in enumerate(regions, 1):
+
+    def deploy_region(region):
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
         gd = boto3.client("guardduty", region_name=region)
         if not gd.list_detectors()["DetectorIds"]:
             created_detector = gd.create_detector(Enable=True)
-            print(f"Created GuardDuty detector: {created_detector['DetectorId']}")
+            print(f"  {region}: Created GuardDuty detector: {created_detector['DetectorId']}")
         else:
-            print(f"Detector already exists: {gd.list_detectors()['DetectorIds'][0]}")
+            print(f"  {region}: Detector already exists: {gd.list_detectors()['DetectorIds'][0]}")
 
         try:
             lmb.get_function(FunctionName="GDPatrol")
@@ -101,7 +107,7 @@ def run(slack_webhook_url=None):
                 Runtime="python3.12",
                 Role=lambda_role_arn,
                 Handler="lambda_function.lambda_handler",
-                Code={"ZipFile": open(zipped, "rb").read()},
+                Code={"ZipFile": zip_data},
                 Timeout=300,
                 MemorySize=128,
                 Environment={"Variables": env_vars},
@@ -127,7 +133,7 @@ def run(slack_webhook_url=None):
             Targets=[{"Id": target_id, "Arn": target_arn, "InputPath": "$.detail"}],
         )
 
-        # We are adding the trigger to the Lambda function so that it will be invoked every time  a finding is sent over
+        # We are adding the trigger to the Lambda function so that it will be invoked every time a finding is sent over
         statement_id = str(randrange(10**11, 10**12))
         lmb.add_permission(
             FunctionName=lambda_response["FunctionName"],
@@ -136,63 +142,64 @@ def run(slack_webhook_url=None):
             Principal="events.amazonaws.com",
             SourceArn=created_rule["RuleArn"],
         )
-        remaining = total_regions - i
-        print(f"[{i}/{total_regions}] Deployed to {region}. {remaining} region{'s' if remaining != 1 else ''} remaining.")
 
         # Create DynamoDB tables if not existed
-        dynamodb_client = boto3.client("dynamodb")
-        
+        dynamodb_client = boto3.client("dynamodb", region_name=region)
+
         # Create main GDPatrol table
         try:
-            response = dynamodb_client.create_table(
+            dynamodb_client.create_table(
                 AttributeDefinitions=[
-                    {
-                        "AttributeName": "network_acl_id",
-                        "AttributeType": "S",
-                    },
-                    {
-                        "AttributeName": "created_at",
-                        "AttributeType": "S",
-                    },
+                    {"AttributeName": "network_acl_id", "AttributeType": "S"},
+                    {"AttributeName": "created_at", "AttributeType": "S"},
                 ],
                 KeySchema=[
-                    {
-                        "AttributeName": "network_acl_id",
-                        "KeyType": "HASH",
-                    },
-                    {
-                        "AttributeName": "created_at",
-                        "KeyType": "RANGE",
-                    },
+                    {"AttributeName": "network_acl_id", "KeyType": "HASH"},
+                    {"AttributeName": "created_at", "KeyType": "RANGE"},
                 ],
                 BillingMode="PAY_PER_REQUEST",
                 TableName="GDPatrol",
             )
-            print("Created DynamoDB table: GDPatrol")
+            print(f"  {region}: Created DynamoDB table: GDPatrol")
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
-        
+
         # Create lock table
         try:
-            response = dynamodb_client.create_table(
+            dynamodb_client.create_table(
                 AttributeDefinitions=[
-                    {
-                        "AttributeName": "lock_id",
-                        "AttributeType": "S",
-                    },
+                    {"AttributeName": "lock_id", "AttributeType": "S"},
                 ],
                 KeySchema=[
-                    {
-                        "AttributeName": "lock_id",
-                        "KeyType": "HASH",
-                    },
+                    {"AttributeName": "lock_id", "KeyType": "HASH"},
                 ],
                 BillingMode="PAY_PER_REQUEST",
                 TableName="GDPatrol_lock",
             )
-            print("Created DynamoDB table: GDPatrol_lock")
+            print(f"  {region}: Created DynamoDB table: GDPatrol_lock")
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
+
+        with count_lock:
+            completed["count"] += 1
+            remaining = total_regions - completed["count"]
+            print(f"[{completed['count']}/{total_regions}] Deployed to {region}. {remaining} region{'s' if remaining != 1 else ''} remaining.")
+
+    failed = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(deploy_region, r): r for r in regions}
+        for future in as_completed(futures):
+            region = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"FAILED: {region} - {e}")
+                failed.append(region)
+
+    if failed:
+        print(f"\nFailed regions: {', '.join(failed)}")
+    else:
+        print(f"\nAll {total_regions} regions deployed successfully.")
 
     remove(zipped)
 
