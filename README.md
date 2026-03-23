@@ -3,7 +3,7 @@
 A Serverless Security Orchestration Automation and Response (SOAR) Framework for AWS GuardDuty.
 The GDPatrol Lambda function receives the GuardDuty findings through the CloudWatch Event Rule and executes
 the appropriate actions to mitigate the threats according to their types and severity.
-The deployment script will enable GuardDuty and deploy the GDPatrol Lambda function in all 
+The deployment script will enable GuardDuty and deploy the GDPatrol Lambda function in all
 supported regions.
 
 ## Important Notes
@@ -24,6 +24,22 @@ The system requires two DynamoDB tables:
 ### Environment Variables
 - `DELETE_NACL_ENTRY_DRY_RUN` (default: "False") - Set to "True" to test NACL entry deletion without actually deleting
 - `SLACK_WEB_HOOK_URL` - Optional: Webhook URL for Slack notifications
+- `GD_PATROL_TABLE` (default: "GDPatrol") - DynamoDB table name
+- `GD_PATROL_LOCK_TABLE` (default: "GDPatrol_lock") - DynamoDB lock table name
+
+## AI-Powered Analysis
+
+GDPatrol uses Claude Sonnet 4.6 on AWS Bedrock to provide AI-enhanced security analysis for high-severity
+findings. When a finding with severity > 5 triggers a Slack notification, the alert is first sent to Claude
+for analysis. The AI provides:
+
+- A human-friendly explanation of the alert
+- Potential impact and severity assessment
+- Investigation and remediation recommendations
+- Additional context for the security team
+
+The AI analysis is appended to the Slack message as an "AI Analysis" field. If the Bedrock call fails,
+the Slack notification is still sent without the analysis.
 
 ## Supported Actions
 
@@ -48,6 +64,21 @@ The actions to be executed are configured in the config.json file:
 }
 ```
 
+## Supported Finding Types
+
+GDPatrol handles findings from multiple AWS resource types:
+
+- **EC2 instances** - Backdoors, trojans, cryptocurrency mining, unauthorized access, port probes, SSH brute force
+- **IAM users** - Pen testing, persistence, reconnaissance, stealth, unauthorized access
+- **RDS databases** - Credential access (brute force, malicious/Tor IP logins), discovery probes
+
+### Supported Action Types
+- `DNS_REQUEST` - Domain-based threats
+- `AWS_API_CALL` - API-based threats
+- `NETWORK_CONNECTION` - Network-based threats
+- `PORT_PROBE` - Port scanning
+- `RDS_LOGIN_ATTEMPT` - RDS database login attempts
+
 ## Getting Started
 
 ### Prerequisites
@@ -67,7 +98,12 @@ Then run the deployment file:
 python3 deploy.py
 ```
 
-The deployment script makes the following calls, make sure your account has the appropriate permissions:
+Optionally pass a Slack webhook URL:
+```bash
+python3 deploy.py --slack-webhook-url https://hooks.slack.com/services/...
+```
+
+The deployment script deploys to all enabled regions in parallel (5 at a time) and requires the following permissions:
 ```
 IAM:
 List Roles, Delete Role Policy, Delete Role, Create Role, Put Role Policy
@@ -82,7 +118,7 @@ GuardDuty:
 List Detectors, Create Detector, Update Detector
 
 Bedrock:
-InvokeModel
+InvokeModel (anthropic.claude-sonnet-4-6)
 
 DynamoDB:
 CreateTable, PutItem, DeleteItem, Query, GetItem, UpdateItem
@@ -93,13 +129,19 @@ CreateTable, PutItem, DeleteItem, Query, GetItem, UpdateItem
 You can easily create your own playbooks by just adding or removing the actions and changing the reliability in the config.json
 for the desired finding type.
 
-By default, all findings are assigned a reliability value of 5: the reliability is then added to the "severity" value 
+By default, all findings are assigned a reliability value of 5: the reliability is then added to the "severity" value
 found in the finding JSON, and the actions are only executed if the sum of the two values is higher than 10.
 
-This ensures that, by default, only the playbooks for the GuardDuty findings with a severity of 6 or higher will be executed, while 
+This ensures that, by default, only the playbooks for the GuardDuty findings with a severity of 6 or higher will be executed, while
 providing a way to effectively yet simply modify the behavior by modifying the reliability value of the config file.
 
-After any change to the config file locally, run deploy.py again and the script will recreate the Lambda function with 
+Some RDS finding types have higher reliability scores to ensure they trigger at lower severity thresholds:
+- Successful brute force: reliability 10 (always triggers)
+- Successful login from malicious/Tor IP: reliability 8
+- Anomalous successful login: reliability 7
+- Failed login from malicious/Tor IP: reliability 6
+
+After any change to the config file locally, run deploy.py again and the script will recreate the Lambda function with
 the updated config.json file.
 
 The GuardDuty findings types are documented [here](https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_finding-types.html).
@@ -109,6 +151,7 @@ The GuardDuty findings types are documented [here](https://docs.aws.amazon.com/g
 GDPatrol uses DynamoDB for distributed locking to prevent race conditions when multiple Lambda functions try to modify Network ACLs simultaneously. The locking mechanism:
 - Uses a separate DynamoDB table (`GDPatrol_lock`)
 - Implements retry logic with configurable max retries and delay
+- Includes TTL-based stale lock detection
 - Automatically releases locks after operations complete
 - Handles lock acquisition failures gracefully
 

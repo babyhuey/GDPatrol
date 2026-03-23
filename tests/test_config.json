@@ -20,6 +20,20 @@
           "snapshot_instance"
         ],
         "reliability": 5
+      },
+      {
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Recon:EC2/PortProbeUnprotectedPort",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
       }
     ]
   }
