@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.14"
-      - run: uv pip install --system pytest moto boto3 requests
-      - run: pytest tests/ -v
+      - run: uv python install 3.14
+      - run: uv venv --python 3.14
+      - run: uv pip install pytest moto boto3 requests
+      - run: uv run pytest tests/ -v
