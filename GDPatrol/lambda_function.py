@@ -32,21 +32,84 @@ ts = time.time()
 st = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def summarize_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract security-relevant fields from a GuardDuty event."""
+    summary: Dict[str, Any] = {
+        "finding_type": event.get("type"),
+        "severity": event.get("severity"),
+        "description": event.get("description"),
+        "region": event.get("region"),
+        "account": event.get("accountId"),
+    }
+
+    # Who / source
+    service = event.get("service", {})
+    action = service.get("action", {})
+    action_type = action.get("actionType")
+    summary["action_type"] = action_type
+
+    if action_type == "AWS_API_CALL":
+        api_action = action.get("awsApiCallAction", {})
+        summary["source_ip"] = api_action.get("remoteIpDetails", {}).get("ipAddressV4")
+        summary["api_call"] = api_action.get("api")
+        summary["service_name"] = api_action.get("serviceName")
+        summary["caller_type"] = api_action.get("callerType")
+    elif action_type == "NETWORK_CONNECTION":
+        net_action = action.get("networkConnectionAction", {})
+        summary["source_ip"] = net_action.get("remoteIpDetails", {}).get("ipAddressV4")
+        summary["direction"] = net_action.get("connectionDirection")
+        summary["protocol"] = net_action.get("protocol")
+        summary["local_port"] = net_action.get("localPortDetails", {}).get("port")
+        summary["remote_port"] = net_action.get("remotePortDetails", {}).get("port")
+    elif action_type == "DNS_REQUEST":
+        summary["domain"] = action.get("dnsRequestAction", {}).get("domain")
+    elif action_type == "PORT_PROBE":
+        probes = action.get("portProbeAction", {}).get("portProbeDetails", [])
+        if probes:
+            summary["source_ip"] = probes[0].get("remoteIpDetails", {}).get("ipAddressV4")
+            summary["probed_port"] = probes[0].get("localPortDetails", {}).get("port")
+    elif action_type == "RDS_LOGIN_ATTEMPT":
+        rds_action = action.get("rdsLoginAttemptAction", {})
+        summary["source_ip"] = rds_action.get("remoteIpDetails", {}).get("ipAddressV4")
+
+    # Target resource
+    resource = event.get("resource", {})
+    resource_type = resource.get("resourceType")
+    summary["resource_type"] = resource_type
+    if resource_type == "Instance":
+        details = resource.get("instanceDetails", {})
+        summary["instance_id"] = details.get("instanceId")
+        summary["instance_type"] = details.get("instanceType")
+        tags = {t["key"]: t["value"] for t in details.get("tags", []) if "key" in t}
+        if "Name" in tags:
+            summary["instance_name"] = tags["Name"]
+    elif resource_type == "AccessKey":
+        details = resource.get("accessKeyDetails", {})
+        summary["username"] = details.get("userName")
+        summary["principal_id"] = details.get("principalId")
+    elif resource_type == "RDSDBInstance":
+        details = resource.get("rdsDbInstanceDetails", {})
+        summary["db_instance"] = details.get("dbInstanceIdentifier")
+        summary["db_engine"] = details.get("engine")
+
+    # Remove None values for cleanliness
+    return {k: v for k, v in summary.items() if v is not None}
+
+
 def enhance_message_with_claude(message_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Enhance the message using Claude Sonnet on AWS Bedrock.
     """
     try:
-        prompt = f"""You are a security expert analyzing a GuardDuty finding. Please analyze this security alert and provide:
-1. A clear, human-friendly explanation of what this alert means
-2. The potential impact and severity of this threat
-3. Specific recommendations for investigation and remediation
-4. Any additional context that would be helpful for the security team
+        prompt = f"""You are a security expert analyzing a GuardDuty finding. Provide a concise analysis:
+1. What this alert means in plain language
+2. Potential impact and severity
+3. Recommended investigation and remediation steps
 
-Here is the alert data:
+Alert data:
 {json.dumps(message_data, indent=2)}
 
-Please format your response in a clear, structured way that would be helpful for a security team to understand and act upon."""
+Be concise — this will appear in a Slack message."""
 
         response = bedrock_client.invoke_model(
             modelId="anthropic.claude-sonnet-4-6",
@@ -650,48 +713,61 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
 
     logger.info(f"GDPatrol: Executed {successful_actions}/{actions_to_be_executed} actions successfully.")
 
-    event_description = event["description"]
-    event_account = event["accountId"]
-    event_region = event["region"]
+    event_summary = summarize_event(event)
     event_severity = event["severity"]
     event_count = event["service"]["count"]
-    event_first_seen = event["service"]["eventFirstSeen"]
-    event_last_seen = event["service"]["eventLastSeen"]
-    event_type = event["type"]
-    # event_id = event["id"]
 
-    # Adding link to finding in the description
-    event_description += f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
+    # Build concise Slack fields from the summary
+    fields = [
+        {"title": "Region", "value": event_summary.get("region", "N/A"), "short": "true"},
+        {"title": "Account", "value": event_summary.get("account", "N/A"), "short": "true"},
+        {"title": "Finding Type", "value": event_summary.get("finding_type", "N/A"), "short": "true"},
+        {"title": "Severity", "value": str(event_severity), "short": "true"},
+        {"title": "First Seen", "value": event["service"]["eventFirstSeen"], "short": "true"},
+        {"title": "Last Seen", "value": event["service"]["eventLastSeen"], "short": "true"},
+        {"title": "Count", "value": str(event_count), "short": "true"},
+        {"title": "Action Type", "value": event_summary.get("action_type", "N/A"), "short": "true"},
+    ]
+
+    # Add source info
+    if "source_ip" in event_summary:
+        fields.append({"title": "Source IP", "value": event_summary["source_ip"], "short": "true"})
+    if "domain" in event_summary:
+        fields.append({"title": "Domain", "value": event_summary["domain"], "short": "true"})
+    if "api_call" in event_summary:
+        fields.append({"title": "API Call", "value": event_summary["api_call"], "short": "true"})
+
+    # Add target info
+    if "instance_id" in event_summary:
+        name = event_summary.get("instance_name", "")
+        value = event_summary["instance_id"] + (f" ({name})" if name else "")
+        fields.append({"title": "Instance", "value": value, "short": "true"})
+    if "username" in event_summary:
+        fields.append({"title": "User", "value": event_summary["username"], "short": "true"})
+    if "db_instance" in event_summary:
+        fields.append({"title": "DB Instance", "value": event_summary["db_instance"], "short": "true"})
+
+    # Add description and actions summary
+    fields.append({"title": "Description", "value": event_summary.get("description", "N/A")})
+    fields.append(
+        {
+            "title": "Actions",
+            "value": f"{successful_actions}/{actions_to_be_executed} executed ({total_config_actions} configured)",
+            "short": "true",
+        }
+    )
 
     guardduty_finding = {
         "attachments": [
             {
-                "fallback": "GuardDuty Finding",
+                "fallback": f"GuardDuty: {event_summary.get('finding_type', 'Unknown')}",
                 "color": "#7e57c2",
-                "title": "New GuardDuty Finding",
-                "footer": "Alert generated at " + str(st),
-                "fields": [
-                    {"title": "Region", "value": event_region, "short": "true"},
-                    {"title": "Account", "value": event_account, "short": "true"},
-                    {"title": "Finding Type", "value": event_type, "short": "true"},
-                    {
-                        "title": "Event First Seen",
-                        "value": event_first_seen,
-                        "short": "true",
-                    },
-                    {
-                        "title": "Event Last Seen",
-                        "value": event_last_seen,
-                        "short": "true",
-                    },
-                    {"title": "Severity", "value": event_severity, "short": "true"},
-                    {"title": "Count", "value": event_count, "short": "true"},
-                    {"title": "Description", "value": event_description},
-                ],
+                "title": f"GuardDuty Finding: {event_summary.get('finding_type', 'Unknown')}",
+                "footer": f"GDPatrol | Finding {finding_id} | {st}",
+                "fields": fields,
             }
         ]
     }
-    # slack.slack_post(event)
     if event_severity > 5:
         publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
     logger.info(
