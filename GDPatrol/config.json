@@ -343,7 +343,7 @@
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "CredentialAccess:RDS/AnomalousBehavior.FailedLogin",
@@ -357,21 +357,21 @@
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 10
       },
       {
         "type": "CredentialAccess:RDS/MaliciousIPCaller.SuccessfulLogin",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 8
       },
       {
         "type": "CredentialAccess:RDS/MaliciousIPCaller.FailedLogin",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 6
       },
       {
         "type": "Discovery:RDS/MaliciousIPCaller",
@@ -385,14 +385,14 @@
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 8
       },
       {
         "type": "CredentialAccess:RDS/TorIPCaller.FailedLogin",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 6
       },
       {
         "type": "Discovery:RDS/TorIPCaller",

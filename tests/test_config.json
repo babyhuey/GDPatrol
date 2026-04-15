@@ -1,0 +1,40 @@
+{
+  "playbooks": {
+    "playbook": [
+      {
+        "type": "Backdoor:EC2/C&CActivity.B!DNS",
+        "actions": [
+          "blacklist_domain",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/Spambot",
+        "actions": [
+          "blacklist_ip",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Recon:EC2/PortProbeUnprotectedPort",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      }
+    ]
+  }
+} 
