@@ -76,7 +76,7 @@ def run():
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
             Layers=[
-                f"arn:aws:lambda:us-east-1:{sts.get_caller_identity()['Account']}:layer:slack:1"
+                f"arn:aws:lambda:{region}:{sts.get_caller_identity()['Account']}:layer:slack:1"
             ],
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
@@ -123,7 +123,7 @@ def run():
         )
 
         # Create DynamoDB table if not existed
-        dynamodb_client = boto3.client('dynamodb')
+        dynamodb_client = boto3.client('dynamodb', region_name=region)
         try:
             response = dynamodb_client.create_table(
                 AttributeDefinitions=[
