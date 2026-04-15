@@ -49,7 +49,19 @@
       "Action": [
         "dynamodb:*"
       ],
-      "Resource": "arn:aws:dynamodb:*:*:table/GDPatrol"
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/GDPatrol",
+        "arn:aws:dynamodb:*:*:table/GDPatrol_lock"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-sonnet-4-6"
+      ]
     }
   ]
 }
