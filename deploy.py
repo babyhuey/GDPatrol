@@ -1,6 +1,7 @@
+import argparse
 import subprocess
 import tempfile
-from os import remove
+from os import environ, remove
 from pathlib import Path
 from random import randrange
 from shutil import copy2, copytree, make_archive, rmtree
@@ -50,7 +51,7 @@ def build_function_zip() -> str:
     return zipped
 
 
-def run():
+def run(slack_web_hook_url=None):
     regions = []
     ec2 = boto3.client("ec2")
     response = ec2.describe_regions()
@@ -83,6 +84,15 @@ def run():
         PolicyDocument=lambda_policy,
     )
 
+    # Pass the Slack webhook through to the function; without it the Lambda
+    # logs "Error publishing message to Slack" and no notification is sent
+    lambda_env = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
+    slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
+    if slack_web_hook_url:
+        lambda_env["SLACK_WEB_HOOK_URL"] = slack_web_hook_url
+    else:
+        print("WARNING: SLACK_WEB_HOOK_URL is not set; Slack notifications will fail.")
+
     for region in regions:
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
@@ -102,16 +112,27 @@ def run():
         except Exception:
             pass
         sleep(7)  # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
-        lambda_response = lmb.create_function(
-            FunctionName="GDPatrol",
-            Runtime=LAMBDA_RUNTIME,
-            Role=lambda_role_arn,
-            Handler="lambda_function.lambda_handler",
-            Code={"ZipFile": open(zipped, "rb").read()},
-            Timeout=300,
-            MemorySize=128,
-            Environment={"Variables": {"DELETE_NACL_ENTRY_DRY_RUN": "False"}},
-        )
+        # A freshly recreated IAM role can take a while to propagate, and
+        # create_function intermittently fails with "The role defined for the
+        # function cannot be assumed by Lambda" until it does — retry with backoff.
+        for attempt in range(5):
+            try:
+                lambda_response = lmb.create_function(
+                    FunctionName="GDPatrol",
+                    Runtime=LAMBDA_RUNTIME,
+                    Role=lambda_role_arn,
+                    Handler="lambda_function.lambda_handler",
+                    Code={"ZipFile": open(zipped, "rb").read()},
+                    Timeout=300,
+                    MemorySize=128,
+                    Environment={"Variables": lambda_env},
+                )
+                break
+            except lmb.exceptions.InvalidParameterValueException as e:
+                if "cannot be assumed" not in str(e) or attempt == 4:
+                    raise
+                print("Role not yet assumable in region {}, retrying...".format(str(region)))
+                sleep(10)
         target_arn = lambda_response["FunctionArn"]
         target_id = "Id" + str(randrange(10**11, 10**12))
 
@@ -198,4 +219,11 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Deploy GDPatrol to all enabled regions")
+    parser.add_argument(
+        "--slack-webhook-url",
+        default=None,
+        help="Slack incoming webhook URL for notifications (falls back to the SLACK_WEB_HOOK_URL environment variable)",
+    )
+    args = parser.parse_args()
+    run(slack_web_hook_url=args.slack_webhook_url)

@@ -105,17 +105,20 @@ def enhance_message_with_claude(message_data: Dict[str, Any]) -> Dict[str, Any]:
 Alert data:
 {json.dumps(message_data, indent=2)}
 
-Be concise — this will appear in a Slack message."""
+Be concise — this will appear in a Slack message attachment. Format the response as Slack mrkdwn, \
+NOT standard Markdown: *single asterisks* for bold, _underscores_ for italic, hyphen bullets. \
+Slack has no heading syntax — use a short bold line instead of ## headings."""
 
         response = bedrock_client.invoke_model(
-            modelId="anthropic.claude-sonnet-4-6",
+            # On-demand invocation requires an inference profile ID, not the bare model ID
+            modelId="global.anthropic.claude-sonnet-4-6",
             body=json.dumps(
                 {
                     "anthropic_version": "bedrock-2023-05-31",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 1000,
+                    # Claude 4.x rejects requests that set both temperature and top_p
                     "temperature": 0.7,
-                    "top_p": 0.9,
                 }
             ),
         )
@@ -257,6 +260,33 @@ def release_lock(lock_table_name: str, lock_id: str) -> None:
         logger.error(f"Error releasing lock: {e}")
 
 
+def delete_dynamodb_rule_entries(nacl_id: str, rule_numbers: set) -> None:
+    """
+    Remove the DynamoDB entries tracking NACL rules that no longer exist in AWS,
+    so the table doesn't drift from the actual NACL state.
+    """
+    if not rule_numbers:
+        return
+    try:
+        response = dynamodb_client.query(
+            TableName=GD_PATROL_TABLE,
+            KeyConditionExpression="#pk = :pk_value",
+            ExpressionAttributeNames={"#pk": "network_acl_id"},
+            ExpressionAttributeValues={":pk_value": {"S": nacl_id}},
+        )
+        for item in response.get("Items", []):
+            if int(item["rule_number"]["S"]) in rule_numbers:
+                dynamodb_client.delete_item(
+                    TableName=GD_PATROL_TABLE,
+                    Key={
+                        "network_acl_id": {"S": nacl_id},
+                        "created_at": {"S": item["created_at"]["S"]},
+                    },
+                )
+    except Exception as e:
+        logger.error(f"Error cleaning up DynamoDB entries for NACL {nacl_id}: {e}")
+
+
 def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = None) -> bool:
     """
     Blacklist an IP address by adding a deny rule to every network ACL.
@@ -310,6 +340,7 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                 deny_rules_sorted = sorted(deny_rules, key=lambda r: r["RuleNumber"])
                 # Keep only the 10 most recent (lowest) rule numbers
                 rules_to_delete = deny_rules_sorted[10:]
+                deleted_rule_numbers = set()
                 for rule in rules_to_delete:
                     try:
                         ec2_client.delete_network_acl_entry(
@@ -317,9 +348,11 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                             NetworkAclId=nacl["NetworkAclId"],
                             RuleNumber=rule["RuleNumber"],
                         )
+                        deleted_rule_numbers.add(rule["RuleNumber"])
                         logger.info(f"Aggressively deleted deny rule {rule['RuleNumber']} in NACL {nacl['NetworkAclId']}")
                     except Exception as e:
                         logger.error(f"Failed to delete deny rule {rule['RuleNumber']}: {e}")
+                delete_dynamodb_rule_entries(nacl["NetworkAclId"], deleted_rule_numbers)
 
             if not deny_rules:
                 # If no deny rules exist, start with rule number 100
@@ -340,6 +373,7 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                                     NetworkAclId=nacl["NetworkAclId"],
                                     RuleNumber=32700,
                                 )
+                                delete_dynamodb_rule_entries(nacl["NetworkAclId"], {32700})
                                 logger.info(f"Deleted existing deny rule 32700 in NACL {nacl['NetworkAclId']}")
                             except Exception as e:
                                 logger.error(f"Failed to delete existing rule 32700: {e}")
@@ -405,16 +439,20 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
 def whitelist_ip(ip_address):
     try:
-        client = boto3.client("ec2")
-        nacls = client.describe_network_acls()
-        for nacl in nacls["NetworkAcls"]:
-            for rule in nacl["Entries"]:
-                if rule.get("CidrBlock") == f"{ip_address}/32":
-                    client.delete_network_acl_entry(
-                        NetworkAclId=nacl["NetworkAclId"],
-                        Egress=rule["Egress"],
-                        RuleNumber=rule["RuleNumber"],
-                    )
+        paginator = ec2_client.get_paginator("describe_network_acls")
+        for page in paginator.paginate():
+            for nacl in page["NetworkAcls"]:
+                removed_rule_numbers = set()
+                for rule in nacl["Entries"]:
+                    if rule.get("CidrBlock") == f"{ip_address}/32":
+                        ec2_client.delete_network_acl_entry(
+                            NetworkAclId=nacl["NetworkAclId"],
+                            Egress=rule["Egress"],
+                            RuleNumber=rule["RuleNumber"],
+                        )
+                        if not rule["Egress"]:
+                            removed_rule_numbers.add(rule["RuleNumber"])
+                delete_dynamodb_rule_entries(nacl["NetworkAclId"], removed_rule_numbers)
         logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}")
         return True
 
@@ -785,31 +823,3 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
     )
-
-
-def create_lock_table():
-    dynamodb = boto3.resource("dynamodb")
-    table_name = "GDPatrol_lock"
-
-    # Check if the table already exists
-    try:
-        table = dynamodb.Table(table_name)
-        if table.table_status not in ["CREATING", "UPDATING", "DELETING", "ACTIVE"]:
-            return
-        logger.info(f"Table '{table_name}' already exists.")
-    except dynamodb.meta.client.exceptions.ResourceNotFoundException:
-        pass  # Table does not exist, proceed with creation
-
-    # Create the table
-    table = dynamodb.create_table(
-        TableName=table_name,
-        KeySchema=[{"AttributeName": "lock_id", "KeyType": "HASH"}],  # Partition key
-        AttributeDefinitions=[
-            {"AttributeName": "lock_id", "AttributeType": "S"}  # String
-        ],
-        ProvisionedThroughput={"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
-    )
-
-    # Wait until the table exists, this will block until the table is created
-    table.meta.client.get_waiter("table_exists").wait(TableName=table_name)
-    logger.info(f"Table '{table_name}' created successfully.")
