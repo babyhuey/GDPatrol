@@ -108,7 +108,8 @@ Alert data:
 Be concise — this will appear in a Slack message."""
 
         response = bedrock_client.invoke_model(
-            modelId="anthropic.claude-sonnet-4-6",
+            # On-demand invocation requires an inference profile ID, not the bare model ID
+            modelId="global.anthropic.claude-sonnet-4-6",
             body=json.dumps(
                 {
                     "anthropic_version": "bedrock-2023-05-31",

@@ -70,6 +70,7 @@ def test_enhance_message_with_claude(mock_bedrock):
     result = enhance_message_with_claude(test_message)
 
     mock_bedrock.invoke_model.assert_called_once()
+    assert mock_bedrock.invoke_model.call_args[1]["modelId"] == "global.anthropic.claude-sonnet-4-6"
     call_body = json.loads(mock_bedrock.invoke_model.call_args[1]["body"])
     assert call_body["anthropic_version"] == "bedrock-2023-05-31"
     assert len(call_body["messages"]) == 1

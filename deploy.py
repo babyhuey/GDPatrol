@@ -1,6 +1,6 @@
 import subprocess
 import tempfile
-from os import remove
+from os import environ, remove
 from pathlib import Path
 from random import randrange
 from shutil import copy2, copytree, make_archive, rmtree
@@ -83,6 +83,14 @@ def run():
         PolicyDocument=lambda_policy,
     )
 
+    # Pass the Slack webhook through to the function; without it the Lambda
+    # logs "Error publishing message to Slack" and no notification is sent
+    lambda_env = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
+    if environ.get("SLACK_WEB_HOOK_URL"):
+        lambda_env["SLACK_WEB_HOOK_URL"] = environ["SLACK_WEB_HOOK_URL"]
+    else:
+        print("WARNING: SLACK_WEB_HOOK_URL is not set; Slack notifications will fail.")
+
     for region in regions:
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
@@ -110,7 +118,7 @@ def run():
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
             MemorySize=128,
-            Environment={"Variables": {"DELETE_NACL_ENTRY_DRY_RUN": "False"}},
+            Environment={"Variables": lambda_env},
         )
         target_arn = lambda_response["FunctionArn"]
         target_id = "Id" + str(randrange(10**11, 10**12))
