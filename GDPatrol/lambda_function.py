@@ -105,7 +105,9 @@ def enhance_message_with_claude(message_data: Dict[str, Any]) -> Dict[str, Any]:
 Alert data:
 {json.dumps(message_data, indent=2)}
 
-Be concise — this will appear in a Slack message."""
+Be concise — this will appear in a Slack message attachment. Format the response as Slack mrkdwn, \
+NOT standard Markdown: *single asterisks* for bold, _underscores_ for italic, hyphen bullets. \
+Slack has no heading syntax — use a short bold line instead of ## headings."""
 
         response = bedrock_client.invoke_model(
             # On-demand invocation requires an inference profile ID, not the bare model ID
