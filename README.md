@@ -155,10 +155,6 @@ GDPatrol uses DynamoDB for distributed locking to prevent race conditions when m
 - Automatically releases locks after operations complete
 - Handles lock acquisition failures gracefully
 
-## Authors
-
-* **Antonio Sorrentino** - [https://siemdetection.com](https://siemdetection.com)
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details
