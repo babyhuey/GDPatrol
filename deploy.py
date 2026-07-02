@@ -112,16 +112,27 @@ def run(slack_web_hook_url=None):
         except Exception:
             pass
         sleep(7)  # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
-        lambda_response = lmb.create_function(
-            FunctionName="GDPatrol",
-            Runtime=LAMBDA_RUNTIME,
-            Role=lambda_role_arn,
-            Handler="lambda_function.lambda_handler",
-            Code={"ZipFile": open(zipped, "rb").read()},
-            Timeout=300,
-            MemorySize=128,
-            Environment={"Variables": lambda_env},
-        )
+        # A freshly recreated IAM role can take a while to propagate, and
+        # create_function intermittently fails with "The role defined for the
+        # function cannot be assumed by Lambda" until it does — retry with backoff.
+        for attempt in range(5):
+            try:
+                lambda_response = lmb.create_function(
+                    FunctionName="GDPatrol",
+                    Runtime=LAMBDA_RUNTIME,
+                    Role=lambda_role_arn,
+                    Handler="lambda_function.lambda_handler",
+                    Code={"ZipFile": open(zipped, "rb").read()},
+                    Timeout=300,
+                    MemorySize=128,
+                    Environment={"Variables": lambda_env},
+                )
+                break
+            except lmb.exceptions.InvalidParameterValueException as e:
+                if "cannot be assumed" not in str(e) or attempt == 4:
+                    raise
+                print("Role not yet assumable in region {}, retrying...".format(str(region)))
+                sleep(10)
         target_arn = lambda_response["FunctionArn"]
         target_id = "Id" + str(randrange(10**11, 10**12))
 
