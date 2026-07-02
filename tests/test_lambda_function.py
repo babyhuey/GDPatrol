@@ -12,6 +12,7 @@ from GDPatrol.lambda_function import (
     publish_message,
     create_network_acl_entry,
     delete_oldest_acl_entry,
+    delete_dynamodb_rule_entries,
     acquire_lock,
     release_lock,
     blacklist_ip,
@@ -186,6 +187,40 @@ def test_blacklist_ip_invalid_ip_does_not_touch_lock(mock_release):
     """An invalid IP returns False before any locking happens."""
     assert blacklist_ip("not-an-ip") is False
     mock_release.assert_not_called()
+
+
+def test_whitelist_ip_cleans_dynamodb(mock_ec2_client, mock_dynamodb_client):
+    """Whitelisting an IP also removes the DynamoDB entries for the deleted rules."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    assert blacklist_ip("203.0.113.77") is True
+    assert mock_dynamodb_client.scan(TableName="GDPatrol")["Count"] > 0
+
+    assert whitelist_ip("203.0.113.77") is True
+    assert mock_dynamodb_client.scan(TableName="GDPatrol")["Count"] == 0
+
+
+def test_delete_dynamodb_rule_entries(mock_dynamodb_client):
+    """Only the entries matching the deleted rule numbers are removed."""
+    create_gdpatrol_table(mock_dynamodb_client)
+    for created_at, rule_number in [("100.0", "50"), ("200.0", "60")]:
+        mock_dynamodb_client.put_item(
+            TableName="GDPatrol",
+            Item={
+                "network_acl_id": {"S": "acl-123"},
+                "created_at": {"S": created_at},
+                "rule_number": {"S": rule_number},
+            },
+        )
+
+    delete_dynamodb_rule_entries("acl-123", {50})
+
+    items = mock_dynamodb_client.scan(TableName="GDPatrol")["Items"]
+    assert len(items) == 1
+    assert items[0]["rule_number"]["S"] == "60"
 
 
 @patch("boto3.client")
