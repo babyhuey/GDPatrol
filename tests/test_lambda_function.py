@@ -7,6 +7,7 @@ from pathlib import Path
 
 # Add the parent directory to sys.path to import the lambda function
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import GDPatrol.lambda_function as lambda_module
 from GDPatrol.lambda_function import (
     enhance_message_with_claude,
     publish_message,
@@ -223,6 +224,53 @@ def test_delete_dynamodb_rule_entries(mock_dynamodb_client):
     items = mock_dynamodb_client.scan(TableName="GDPatrol")["Items"]
     assert len(items) == 1
     assert items[0]["rule_number"]["S"] == "60"
+
+
+def test_delete_dynamodb_rule_entries_skips_malformed_items(mock_dynamodb_client):
+    """A legacy item without rule_number must not abort cleanup of valid items after it."""
+    create_gdpatrol_table(mock_dynamodb_client)
+    # created_at "100.0" sorts before "50.0" lexicographically, so the malformed
+    # item is encountered first
+    mock_dynamodb_client.put_item(
+        TableName="GDPatrol",
+        Item={"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "100.0"}},
+    )
+    mock_dynamodb_client.put_item(
+        TableName="GDPatrol",
+        Item={"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "50.0"}, "rule_number": {"S": "50"}},
+    )
+
+    delete_dynamodb_rule_entries("acl-123", {50})
+
+    items = mock_dynamodb_client.scan(TableName="GDPatrol")["Items"]
+    assert len(items) == 1
+    assert "rule_number" not in items[0]
+
+
+def test_whitelist_ip_partial_failure_still_cleans_dynamodb(mock_ec2_client, mock_dynamodb_client, monkeypatch):
+    """One failed rule delete reports failure but doesn't block cleanup for the rest."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    assert blacklist_ip("203.0.113.88") is True
+    assert mock_dynamodb_client.scan(TableName="GDPatrol")["Count"] >= 2
+
+    real_delete = lambda_module.ec2_client.delete_network_acl_entry
+    calls = {"count": 0}
+
+    def flaky_delete(**kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise Exception("InvalidNetworkAclEntry.NotFound")
+        return real_delete(**kwargs)
+
+    monkeypatch.setattr(lambda_module.ec2_client, "delete_network_acl_entry", flaky_delete)
+
+    assert whitelist_ip("203.0.113.88") is False
+    # Only the rule whose delete failed keeps its DynamoDB entry
+    assert mock_dynamodb_client.scan(TableName="GDPatrol")["Count"] == 1
 
 
 @patch("boto3.client")

@@ -268,21 +268,27 @@ def delete_dynamodb_rule_entries(nacl_id: str, rule_numbers: set) -> None:
     if not rule_numbers:
         return
     try:
-        response = dynamodb_client.query(
+        paginator = dynamodb_client.get_paginator("query")
+        for page in paginator.paginate(
             TableName=GD_PATROL_TABLE,
             KeyConditionExpression="#pk = :pk_value",
             ExpressionAttributeNames={"#pk": "network_acl_id"},
             ExpressionAttributeValues={":pk_value": {"S": nacl_id}},
-        )
-        for item in response.get("Items", []):
-            if int(item["rule_number"]["S"]) in rule_numbers:
-                dynamodb_client.delete_item(
-                    TableName=GD_PATROL_TABLE,
-                    Key={
-                        "network_acl_id": {"S": nacl_id},
-                        "created_at": {"S": item["created_at"]["S"]},
-                    },
-                )
+        ):
+            for item in page.get("Items", []):
+                # Skip legacy/malformed items so one bad row doesn't abort the cleanup
+                try:
+                    rule_number = int(item["rule_number"]["S"])
+                except KeyError, ValueError:
+                    continue
+                if rule_number in rule_numbers:
+                    dynamodb_client.delete_item(
+                        TableName=GD_PATROL_TABLE,
+                        Key={
+                            "network_acl_id": {"S": nacl_id},
+                            "created_at": {"S": item["created_at"]["S"]},
+                        },
+                    )
     except Exception as e:
         logger.error(f"Error cleaning up DynamoDB entries for NACL {nacl_id}: {e}")
 
@@ -439,22 +445,32 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
 def whitelist_ip(ip_address):
     try:
+        all_deleted = True
         paginator = ec2_client.get_paginator("describe_network_acls")
         for page in paginator.paginate():
             for nacl in page["NetworkAcls"]:
                 removed_rule_numbers = set()
                 for rule in nacl["Entries"]:
                     if rule.get("CidrBlock") == f"{ip_address}/32":
-                        ec2_client.delete_network_acl_entry(
-                            NetworkAclId=nacl["NetworkAclId"],
-                            Egress=rule["Egress"],
-                            RuleNumber=rule["RuleNumber"],
-                        )
+                        # Per-rule handling: a failed delete (e.g. a concurrent run already
+                        # removed it) must not stop the DynamoDB cleanup for rules that
+                        # were successfully deleted, or the table drifts again
+                        try:
+                            ec2_client.delete_network_acl_entry(
+                                NetworkAclId=nacl["NetworkAclId"],
+                                Egress=rule["Egress"],
+                                RuleNumber=rule["RuleNumber"],
+                            )
+                        except Exception as e:
+                            logger.error(f"GDPatrol: Error deleting rule {rule['RuleNumber']} in NACL {nacl['NetworkAclId']}: {e}")
+                            all_deleted = False
+                            continue
                         if not rule["Egress"]:
                             removed_rule_numbers.add(rule["RuleNumber"])
                 delete_dynamodb_rule_entries(nacl["NetworkAclId"], removed_rule_numbers)
-        logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}")
-        return True
+        if all_deleted:
+            logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}")
+        return all_deleted
 
     except Exception as e:
         logger.error(f"GDPatrol: Error executing {stack()[0][3]} - {e}")
