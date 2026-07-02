@@ -1,5 +1,7 @@
 # GDPatrol
 
+> **Status:** Actively maintained fork. The original repository was archived; this fork carries the project forward.
+
 A Serverless Security Orchestration Automation and Response (SOAR) Framework for AWS GuardDuty.
 The GDPatrol Lambda function receives the GuardDuty findings through the CloudWatch Event Rule and executes
 the appropriate actions to mitigate the threats according to their types and severity.
