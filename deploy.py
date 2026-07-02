@@ -1,22 +1,65 @@
+import subprocess
+import tempfile
 from os import remove
+from pathlib import Path
 from random import randrange
-from shutil import make_archive
+from shutil import copy2, copytree, make_archive, rmtree
 from time import sleep
 import boto3
+
+LAMBDA_RUNTIME = "python3.14"
+LAMBDA_REQUIREMENTS = ["requests>=2.32.0"]
+
+
+def build_function_zip() -> str:
+    """Build the Lambda deployment zip with source + vendored dependencies.
+
+    Uses uv to install linux-x86_64 wheels for LAMBDA_RUNTIME alongside the
+    GDPatrol source, then zips the combined directory.
+    """
+    build_dir = Path(tempfile.mkdtemp(prefix="gdpatrol-build-"))
+    src = Path("GDPatrol")
+    for entry in src.iterdir():
+        if entry.name == "__pycache__":
+            continue
+        dest = build_dir / entry.name
+        if entry.is_dir():
+            copytree(entry, dest)
+        else:
+            copy2(entry, dest)
+    py_version = LAMBDA_RUNTIME.removeprefix("python")
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--target",
+            str(build_dir),
+            "--python-platform",
+            "x86_64-manylinux2014",
+            "--python-version",
+            py_version,
+            *LAMBDA_REQUIREMENTS,
+        ],
+        check=True,
+    )
+    for cache in build_dir.rglob("__pycache__"):
+        rmtree(cache, ignore_errors=True)
+    zipped = make_archive("GDPatrol", "zip", root_dir=str(build_dir))
+    rmtree(build_dir, ignore_errors=True)
+    return zipped
 
 
 def run():
     regions = []
     ec2 = boto3.client("ec2")
-    sts = boto3.client("sts")
     response = ec2.describe_regions()
     for i in response["Regions"]:
         regions.append(i["RegionName"])
 
-    output_filename = "GDPatrol"
     with open("role_policy.json") as rp:
         assume_role_policy = rp.read()
-    zipped = make_archive(output_filename, "zip", root_dir="GDPatrol")
+    zipped = build_function_zip()
 
     with open("lambda_policy.json") as lp:
         lambda_policy = lp.read()
@@ -61,10 +104,9 @@ def run():
         sleep(7)  # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
         lambda_response = lmb.create_function(
             FunctionName="GDPatrol",
-            Runtime="python3.14",
+            Runtime=LAMBDA_RUNTIME,
             Role=lambda_role_arn,
             Handler="lambda_function.lambda_handler",
-            Layers=[f"arn:aws:lambda:{region}:{sts.get_caller_identity()['Account']}:layer:slack:1"],
             Code={"ZipFile": open(zipped, "rb").read()},
             Timeout=300,
             MemorySize=128,

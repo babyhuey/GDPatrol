@@ -83,14 +83,15 @@ GDPatrol handles findings from multiple AWS resource types:
 
 ### Prerequisites
 
-* Python 3.12 or later
-* Boto3 >= 1.34.0
-* Requests >= 2.31.0
+* Python 3.14 or later
+* Boto3 >= 1.39.0
+* Requests >= 2.32.0
+* [uv](https://docs.astral.sh/uv/)
 
 ### Installing
 Clone the project and install dependencies:
 ```bash
-python3 -m pip install -r requirements.txt
+uv pip install -r requirements.txt
 ```
 
 Then run the deployment file:
@@ -98,10 +99,9 @@ Then run the deployment file:
 python3 deploy.py
 ```
 
-Optionally pass a Slack webhook URL:
-```bash
-python3 deploy.py --slack-webhook-url https://hooks.slack.com/services/...
-```
+To enable Slack notifications, set the `SLACK_WEB_HOOK_URL` environment variable on the deployed
+`GDPatrol` Lambda function (via the AWS Console or CLI) after running `deploy.py` — the deploy script
+does not set this automatically.
 
 The deployment script deploys to all enabled regions in parallel (5 at a time) and requires the following permissions:
 ```

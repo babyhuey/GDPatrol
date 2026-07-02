@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - IP address validation logic
 - Environment variable handling in tests
 - Import issues with moto library
-- Configuration file handling in tests 
+- Configuration file handling in tests
+- Removed dependency on a pre-existing "slack" Lambda Layer (tied to the original account); deploy.py now vendors dependencies directly into the deployment zip via uv
 
 ### Security & Reliability Improvements
 - Aggressive NACL cleanup: when NACL deny rules approach the AWS limit, automatically delete all but the 10 most recent deny rules before adding a new one
