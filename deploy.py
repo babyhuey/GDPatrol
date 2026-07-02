@@ -1,3 +1,4 @@
+import argparse
 import subprocess
 import tempfile
 from os import environ, remove
@@ -50,7 +51,7 @@ def build_function_zip() -> str:
     return zipped
 
 
-def run():
+def run(slack_web_hook_url=None):
     regions = []
     ec2 = boto3.client("ec2")
     response = ec2.describe_regions()
@@ -86,8 +87,9 @@ def run():
     # Pass the Slack webhook through to the function; without it the Lambda
     # logs "Error publishing message to Slack" and no notification is sent
     lambda_env = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
-    if environ.get("SLACK_WEB_HOOK_URL"):
-        lambda_env["SLACK_WEB_HOOK_URL"] = environ["SLACK_WEB_HOOK_URL"]
+    slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
+    if slack_web_hook_url:
+        lambda_env["SLACK_WEB_HOOK_URL"] = slack_web_hook_url
     else:
         print("WARNING: SLACK_WEB_HOOK_URL is not set; Slack notifications will fail.")
 
@@ -206,4 +208,11 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser(description="Deploy GDPatrol to all enabled regions")
+    parser.add_argument(
+        "--slack-webhook-url",
+        default=None,
+        help="Slack incoming webhook URL for notifications (falls back to the SLACK_WEB_HOOK_URL environment variable)",
+    )
+    args = parser.parse_args()
+    run(slack_web_hook_url=args.slack_webhook_url)
