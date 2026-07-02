@@ -161,6 +161,7 @@ This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md
 
 ## Acknowledgments
 
+* This project is forked from and builds on the great work of Antonio Sorrentino, the original author of GDPatrol.
 * Most of the actions code was adapted from the AWS Phantom app published by Booz Allen Hamilton.
 
 **Note:** By enabling GuardDuty, you might incur in additional costs. However, since the service is
