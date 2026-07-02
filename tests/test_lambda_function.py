@@ -156,6 +156,38 @@ def test_blacklist_ip(mock_ec2_client, mock_dynamodb_client):
     assert result is True
 
 
+def test_blacklist_ip_blocks_all_nacls(mock_ec2_client, mock_dynamodb_client):
+    """blacklist_ip must add a deny rule to every NACL, not just the first one."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    assert blacklist_ip("203.0.113.9") is True
+
+    for nacl in mock_ec2_client.describe_network_acls()["NetworkAcls"]:
+        assert any(not e["Egress"] and e["RuleAction"] == "deny" and e.get("CidrBlock") == "203.0.113.9/32" for e in nacl["Entries"]), (
+            f"IP not blocked in NACL {nacl['NetworkAclId']}"
+        )
+
+
+@patch("GDPatrol.lambda_function.release_lock")
+@patch("GDPatrol.lambda_function.acquire_lock")
+def test_blacklist_ip_no_release_when_acquire_fails(mock_acquire, mock_release):
+    """A failed acquire_lock must not release another invocation's lock."""
+    mock_acquire.side_effect = Exception("Unable to acquire lock after multiple attempts")
+    assert blacklist_ip("198.51.100.1") is False
+    mock_release.assert_not_called()
+
+
+@patch("GDPatrol.lambda_function.release_lock")
+def test_blacklist_ip_invalid_ip_does_not_touch_lock(mock_release):
+    """An invalid IP returns False before any locking happens."""
+    assert blacklist_ip("not-an-ip") is False
+    mock_release.assert_not_called()
+
+
 @patch("boto3.client")
 def test_lambda_handler_ec2_finding(
     mock_boto3_client,

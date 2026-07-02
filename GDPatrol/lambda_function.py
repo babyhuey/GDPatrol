@@ -27,10 +27,6 @@ ec2_client = boto3.client("ec2")
 dynamodb_client = boto3.client("dynamodb")
 bedrock_client = boto3.client("bedrock-runtime")
 
-# Grabbing the current timestamp for the footer
-ts = time.time()
-st = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
 
 def summarize_event(event: Dict[str, Any]) -> Dict[str, Any]:
     """Extract security-relevant fields from a GuardDuty event."""
@@ -263,21 +259,24 @@ def release_lock(lock_table_name: str, lock_id: str) -> None:
 
 def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = None) -> bool:
     """
-    Blacklist an IP address by adding it to the network ACLs.
+    Blacklist an IP address by adding a deny rule to every network ACL.
+    Returns True only if the IP is blocked in all NACLs.
     """
+    # Validate IP address
     try:
-        # Validate IP address
-        try:
-            ipaddress.ip_address(ip_address)
-        except ValueError:
-            logger.error(f"Invalid IP address: {ip_address}")
-            return False
+        ipaddress.ip_address(ip_address)
+    except ValueError:
+        logger.error(f"Invalid IP address: {ip_address}")
+        return False
 
-        # Use env table names if not provided
-        lock_table_name = lock_table_name or GD_PATROL_LOCK_TABLE
-        # Make lock_id resource-specific
-        lock_id = lock_id or f"lock-{ip_address}"
+    # Use env table names if not provided
+    lock_table_name = lock_table_name or GD_PATROL_LOCK_TABLE
+    # Make lock_id resource-specific
+    lock_id = lock_id or f"lock-{ip_address}"
+    lock_acquired = False
+    try:
         acquire_lock(lock_table_name, lock_id)
+        lock_acquired = True
 
         # Use paginator for NACLs
         paginator = ec2_client.get_paginator("describe_network_acls")
@@ -285,6 +284,7 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
         for page in paginator.paginate():
             nacls.extend(page["NetworkAcls"])
 
+        blocked_count = 0
         for nacl in nacls:
             # Check if IP is already blacklisted in this NACL
             existing_rule = None
@@ -297,6 +297,7 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                 logger.info(
                     f"IP {ip_address} is already blacklisted in NACL {nacl['NetworkAclId']} with rule {existing_rule['RuleNumber']}"
                 )
+                blocked_count += 1
                 continue
 
             # Get all deny rules for this NACL
@@ -305,9 +306,9 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
             # Check if we're approaching the limit (max 20 rules per direction)
             if len(deny_rules) >= 19:
                 logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, performing aggressive cleanup.")
-                # Sort deny rules by RuleNumber descending (most recent/highest first)
-                deny_rules_sorted = sorted(deny_rules, key=lambda r: r["RuleNumber"], reverse=True)
-                # Keep only the 10 most recent/highest rule numbers
+                # New rules get decreasing numbers (min - 1), so the lowest rule numbers are the most recent
+                deny_rules_sorted = sorted(deny_rules, key=lambda r: r["RuleNumber"])
+                # Keep only the 10 most recent (lowest) rule numbers
                 rules_to_delete = deny_rules_sorted[10:]
                 for rule in rules_to_delete:
                     try:
@@ -359,8 +360,8 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                     },
                 )
 
-                logger.info(f"Successfully blacklisted IP: {ip_address}")
-                return True
+                logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']}")
+                blocked_count += 1
 
             except Exception as error:
                 logger.info(f"INFO: {error}")
@@ -379,21 +380,27 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                                 "rule_number": {"S": str(target_rule_number)},
                             },
                         )
-                        logger.info(f"Successfully blacklisted IP: {ip_address} after deleting oldest entry")
-                        return True
+                        logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} after deleting oldest entry")
+                        blocked_count += 1
                     except Exception as retry_error:
                         logger.error(f"Failed to create entry after deleting oldest: {retry_error}")
-                        # Try the next NACL instead of continuing with the same one
-                        break
+                        # Try the next NACL
+                        continue
                 else:
                     logger.error(f"Error creating network_acl entry: {error}")
                     continue
+
+        if nacls and blocked_count == len(nacls):
+            logger.info(f"Successfully blacklisted IP: {ip_address} in {blocked_count} NACL(s)")
+            return True
+        logger.error(f"Blacklisted IP {ip_address} in only {blocked_count}/{len(nacls)} NACLs")
+        return False
     except Exception as e:
         logger.error(f"Error executing blacklist_ip: {e}")
         return False
     finally:
-        release_lock(lock_table_name, lock_id)
-    return False
+        if lock_acquired:
+            release_lock(lock_table_name, lock_id)
 
 
 def whitelist_ip(ip_address):
@@ -607,6 +614,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     except KeyError as e:
         logger.error(f"GDPatrol: Could not parse the Finding fields correctly, please verify that the JSON is correct. {e}")
         return
+    instance_id = None
+    vpc_id = None
+    username = None
     if resource_type == "Instance":
         instance = event["resource"]["instanceDetails"]
         instance_id = instance["instanceId"]
@@ -757,6 +767,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         }
     )
 
+    # Timestamp for the footer, computed per invocation
+    st = datetime.datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
     guardduty_finding = {
         "attachments": [
             {

@@ -173,6 +173,27 @@ def run():
         except dynamodb_client.exceptions.ResourceInUseException:
             pass
 
+        # Create the lock table used by blacklist_ip's acquire_lock/release_lock
+        try:
+            response = dynamodb_client.create_table(
+                AttributeDefinitions=[
+                    {
+                        "AttributeName": "lock_id",
+                        "AttributeType": "S",
+                    },
+                ],
+                KeySchema=[
+                    {
+                        "AttributeName": "lock_id",
+                        "KeyType": "HASH",
+                    },
+                ],
+                BillingMode="PAY_PER_REQUEST",
+                TableName="GDPatrol_lock",
+            )
+        except dynamodb_client.exceptions.ResourceInUseException:
+            pass
+
     remove(zipped)
 
 
