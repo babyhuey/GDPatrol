@@ -115,8 +115,8 @@ Be concise — this will appear in a Slack message."""
                     "anthropic_version": "bedrock-2023-05-31",
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 1000,
+                    # Claude 4.x rejects requests that set both temperature and top_p
                     "temperature": 0.7,
-                    "top_p": 0.9,
                 }
             ),
         )

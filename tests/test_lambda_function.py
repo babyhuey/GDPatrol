@@ -73,6 +73,7 @@ def test_enhance_message_with_claude(mock_bedrock):
     assert mock_bedrock.invoke_model.call_args[1]["modelId"] == "global.anthropic.claude-sonnet-4-6"
     call_body = json.loads(mock_bedrock.invoke_model.call_args[1]["body"])
     assert call_body["anthropic_version"] == "bedrock-2023-05-31"
+    assert "top_p" not in call_body  # temperature and top_p are mutually exclusive on Claude 4.x
     assert len(call_body["messages"]) == 1
     assert call_body["messages"][0]["role"] == "user"
 
