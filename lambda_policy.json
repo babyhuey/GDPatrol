@@ -60,7 +60,7 @@
         "bedrock:InvokeModel"
       ],
       "Resource": [
-        "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-sonnet-4-6",
+        "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-sonnet-4-6*",
         "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-sonnet-4-6"
       ]
     }
