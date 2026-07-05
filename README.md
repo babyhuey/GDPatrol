@@ -105,7 +105,7 @@ To enable Slack notifications, set the `SLACK_WEB_HOOK_URL` environment variable
 `GDPatrol` Lambda function (via the AWS Console or CLI) after running `deploy.py` — the deploy script
 does not set this automatically.
 
-The deployment script deploys to all enabled regions in parallel (5 at a time) and requires the following permissions:
+The deployment script deploys to all enabled regions sequentially and requires the following permissions:
 ```
 IAM:
 List Roles, Delete Role Policy, Delete Role, Create Role, Put Role Policy

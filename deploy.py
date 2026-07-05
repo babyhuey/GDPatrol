@@ -66,17 +66,18 @@ def run(slack_web_hook_url=None):
         lambda_policy = lp.read()
 
     iam = boto3.client("iam")
-    # delete the role if it already exists, so it can be deployed with
-    # the latest configuration
-
+    # get-or-create the role so already-deployed Lambdas in other regions that
+    # reference it keep working during redeploy; put_role_policy is idempotent,
+    # so it's safe to call whether the role is new or already existed.
+    lambda_role_arn = None
     for response in iam.get_paginator("list_roles").paginate():
         for role in response["Roles"]:
             if role["RoleName"] == "GDPatrolRole":
-                iam.delete_role_policy(RoleName="GDPatrolRole", PolicyName="GDPatrol_lambda_policy")
-                iam.delete_role(RoleName="GDPatrolRole")
+                lambda_role_arn = role["Arn"]
 
-    created_role = iam.create_role(RoleName="GDPatrolRole", AssumeRolePolicyDocument=assume_role_policy)
-    lambda_role_arn = created_role["Role"]["Arn"]
+    if lambda_role_arn is None:
+        created_role = iam.create_role(RoleName="GDPatrolRole", AssumeRolePolicyDocument=assume_role_policy)
+        lambda_role_arn = created_role["Role"]["Arn"]
 
     iam.put_role_policy(
         RoleName="GDPatrolRole",
@@ -101,18 +102,11 @@ def run(slack_web_hook_url=None):
             created_detector = gd.create_detector(Enable=True)
             print("Created GuardDuty detector: {}".format(created_detector["DetectorId"]))
         else:
-            # gd.update_detector(
-            #     DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
-            # )
+            gd.update_detector(DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True)
             print("Detector already exists: {}".format(gd.list_detectors()["DetectorIds"][0]))
 
-        try:
-            lmb.get_function(FunctionName="GDPatrol")
-            lmb.delete_function(FunctionName="GDPatrol")
-        except Exception:
-            pass
-        sleep(7)  # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
-        # A freshly recreated IAM role can take a while to propagate, and
+        sleep(7)  # Lambda bug: create function right after the role is created will cause AccessDeniedExceptionKMS error
+        # A freshly created IAM role can take a while to propagate, and
         # create_function intermittently fails with "The role defined for the
         # function cannot be assumed by Lambda" until it does — retry with backoff.
         for attempt in range(5):
@@ -128,6 +122,23 @@ def run(slack_web_hook_url=None):
                     Environment={"Variables": lambda_env},
                 )
                 break
+            except lmb.exceptions.ResourceConflictException:
+                # The function already exists (e.g. a redeploy) — update it in place
+                # instead of failing, so a stale function never blocks the deploy.
+                lambda_response = lmb.update_function_code(
+                    FunctionName="GDPatrol",
+                    ZipFile=open(zipped, "rb").read(),
+                )
+                lmb.update_function_configuration(
+                    FunctionName="GDPatrol",
+                    Runtime=LAMBDA_RUNTIME,
+                    Role=lambda_role_arn,
+                    Handler="lambda_function.lambda_handler",
+                    Timeout=300,
+                    MemorySize=128,
+                    Environment={"Variables": lambda_env},
+                )
+                break
             except lmb.exceptions.InvalidParameterValueException as e:
                 if "cannot be assumed" not in str(e) or attempt == 4:
                     raise
@@ -136,14 +147,6 @@ def run(slack_web_hook_url=None):
         target_arn = lambda_response["FunctionArn"]
         target_id = "Id" + str(randrange(10**11, 10**12))
 
-        # Remove targets and delete the CloudWatch rule before recreating it
-        rules = cw_events.list_rules(NamePrefix="GDPatrol")["Rules"]
-        for rule in rules:
-            if rule["Name"] == "GDPatrol":
-                targets = cw_events.list_targets_by_rule(Rule=rule["Name"])["Targets"]
-                for target in targets:
-                    cw_events.remove_targets(Rule=rule["Name"], Ids=[target["Id"]])
-                cw_events.delete_rule(Name="GDPatrol")
         created_rule = cw_events.put_rule(
             Name="GDPatrol",
             EventPattern='{"source":["aws.guardduty"],"detail-type":["GuardDuty Finding"]}',
