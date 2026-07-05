@@ -1098,6 +1098,43 @@ def test_lambda_handler_survives_missing_slack_fields(monkeypatch):
         mock_publish.assert_called_once()
 
 
+def test_lambda_handler_string_severity_does_not_crash_notify(monkeypatch):
+    """A numeric-string severity must not crash the notify gate after actions have run."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "severity": "9",  # arrives as a string, not a number
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "RDSDBInstance",
+            "rdsDbInstanceDetails": {"dbInstanceIdentifier": "testdb", "engine": "mysql"},
+        },
+        "service": {
+            "action": {
+                "actionType": "RDS_LOGIN_ATTEMPT",
+                "rdsLoginAttemptAction": {"remoteIpDetails": {"ipAddressV4": "1.2.3.4"}},
+            },
+            "count": 1,
+            "eventFirstSeen": "x",
+            "eventLastSeen": "y",
+        },
+        "description": "RDS finding",
+    }
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=True),
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        lambda_handler(event, None)  # must not raise (severity "9" would fail "9" > 5)
+        mock_publish.assert_called_once()
+
+
 def test_lambda_handler_survives_config_load_error():
     """A missing or malformed config.json must be logged, not crash the invocation."""
     event = {

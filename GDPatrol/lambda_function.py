@@ -913,7 +913,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             }
         ]
     }
-    if event_severity > 5:
+    if severity > 5:
         publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
