@@ -343,7 +343,9 @@ def delete_dynamodb_rule_entries(nacl_id: str, rule_numbers: set) -> None:
                 # Skip legacy/malformed items so one bad row doesn't abort the cleanup
                 try:
                     rule_number = int(item["rule_number"]["S"])
-                except (KeyError, ValueError):
+                # Keep the parenthesized tuple: ruff's py314 target would otherwise strip the
+                # parens to `except KeyError, ValueError:`, a SyntaxError on Python <3.14.
+                except (KeyError, ValueError):  # fmt: skip
                     continue
                 if rule_number in rule_numbers:
                     dynamodb_client.delete_item(
