@@ -25,6 +25,7 @@ from GDPatrol.lambda_function import (
     enable_ec2_access,
     disable_sg_access,
     enable_sg_access,
+    _next_free_ingress_deny_rule_number,
     Config,
     lambda_handler,
 )
@@ -307,6 +308,161 @@ def test_blacklist_ip_parameterized(mock_boto3_client, ip_address, expected, moc
         assert blacklist_ip(ip_address) is False
 
 
+def test_blacklist_ip_skips_colliding_allow_rule(mock_ec2_client, mock_dynamodb_client):
+    """The preferred rule number must never collide with, or evict, a pre-existing ALLOW rule."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    nacl_id = nacl["NetworkAcl"]["NetworkAclId"]
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    # An existing GDPatrol deny rule at 100, and a customer ALLOW rule sitting exactly
+    # at the preferred next slot (99).
+    mock_ec2_client.create_network_acl_entry(
+        CidrBlock="9.9.9.9/32", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=100
+    )
+    mock_ec2_client.create_network_acl_entry(
+        CidrBlock="10.0.0.0/24", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="allow", RuleNumber=99
+    )
+
+    assert blacklist_ip("203.0.113.5") is True
+
+    entries = mock_ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]["Entries"]
+    new_rule = next(e for e in entries if e.get("CidrBlock") == "203.0.113.5/32")
+    assert new_rule["RuleNumber"] == 98
+    assert any(e["RuleNumber"] == 99 and e["RuleAction"] == "allow" for e in entries), "pre-existing allow rule was evicted"
+
+
+def test_blacklist_ip_low_end_exhaustion_does_not_evict(mock_ec2_client, mock_dynamodb_client):
+    """When the low end is exhausted, blacklist_ip must search the high end instead of evicting
+    whoever holds the old hardcoded wraparound slot (32700)."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    nacl_id = nacl["NetworkAcl"]["NetworkAclId"]
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    # A GDPatrol deny rule already sits at the lowest usable number.
+    mock_ec2_client.create_network_acl_entry(
+        CidrBlock="9.9.9.9/32", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=1
+    )
+    # Something else already occupies the old hardcoded wraparound target.
+    mock_ec2_client.create_network_acl_entry(
+        CidrBlock="10.0.5.0/24", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=32700
+    )
+
+    assert blacklist_ip("203.0.113.6") is True
+
+    entries = mock_ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]["Entries"]
+    assert any(e["RuleNumber"] == 32700 and e.get("CidrBlock") == "10.0.5.0/24" for e in entries), (
+        "pre-existing occupant of rule 32700 was evicted"
+    )
+    new_rule = next(e for e in entries if e.get("CidrBlock") == "203.0.113.6/32")
+    assert new_rule["RuleNumber"] == 32766
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.delete_oldest_acl_entry")
+@patch("GDPatrol.lambda_function.create_network_acl_entry")
+@patch("GDPatrol.lambda_function._next_free_ingress_deny_rule_number")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_blacklist_ip_cleans_up_when_no_free_rule_number(mock_ec2, mock_next_free, mock_create_entry, mock_delete_oldest, mock_dynamo):
+    """When the helper reports no free rule number, blacklist_ip must delete the oldest entry and retry."""
+    nacl = {"NetworkAclId": "acl-1", "Entries": [{"Egress": False, "RuleAction": "deny", "RuleNumber": 5, "CidrBlock": "9.9.9.9/32"}]}
+    mock_ec2.get_paginator.return_value.paginate.return_value = [{"NetworkAcls": [nacl]}]
+    mock_ec2.describe_network_acls.return_value = {"NetworkAcls": [nacl]}
+    mock_next_free.side_effect = [None, 42]
+    mock_dynamo.exceptions = MagicMock()
+
+    with patch("GDPatrol.lambda_function.acquire_lock"), patch("GDPatrol.lambda_function.release_lock"):
+        result = blacklist_ip("10.0.0.1")
+
+    mock_delete_oldest.assert_called_once_with("acl-1")
+    mock_create_entry.assert_called_once_with("10.0.0.1", "acl-1", 42)
+    assert result is True
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.create_network_acl_entry")
+@patch("GDPatrol.lambda_function._next_free_ingress_deny_rule_number")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_blacklist_ip_retries_on_already_exists(mock_ec2, mock_next_free, mock_create_entry, mock_dynamo):
+    """A NetworkAclEntryAlreadyExists error on create must retry with a fresh free number, not fail
+    the whole NACL silently."""
+    from botocore.exceptions import ClientError
+
+    nacl = {"NetworkAclId": "acl-1", "Entries": []}
+    mock_ec2.get_paginator.return_value.paginate.return_value = [{"NetworkAcls": [nacl]}]
+    mock_ec2.describe_network_acls.return_value = {"NetworkAcls": [nacl]}
+    mock_next_free.side_effect = [99, 98]  # first choice collides, second is fresh
+    mock_create_entry.side_effect = [
+        ClientError({"Error": {"Code": "NetworkAclEntryAlreadyExists", "Message": "x"}}, "CreateNetworkAclEntry"),
+        None,
+    ]
+    mock_dynamo.exceptions = MagicMock()
+
+    with patch("GDPatrol.lambda_function.acquire_lock"), patch("GDPatrol.lambda_function.release_lock"):
+        result = blacklist_ip("10.0.0.1")
+
+    assert result is True
+    assert mock_create_entry.call_args_list[0].args[2] == 99
+    assert mock_create_entry.call_args_list[1].args[2] == 98
+
+
+# --- _next_free_ingress_deny_rule_number tests ---
+
+
+def _acl_entry(rule_number, egress=False, action="deny", cidr="1.2.3.4/32"):
+    return {"RuleNumber": rule_number, "Egress": egress, "RuleAction": action, "CidrBlock": cidr}
+
+
+def test_next_free_rule_number_empty_nacl():
+    """With no entries at all, the first GDPatrol deny rule starts at 100."""
+    assert _next_free_ingress_deny_rule_number([]) == 100
+
+
+def test_next_free_rule_number_prefers_one_below_lowest_deny():
+    """The decrement scheme: a new rule goes one below the current lowest GDPatrol deny rule."""
+    entries = [_acl_entry(50)]
+    assert _next_free_ingress_deny_rule_number(entries) == 49
+
+
+def test_next_free_rule_number_skips_allow_rule_collision():
+    """A pre-existing ALLOW rule at the preferred slot must not be evicted or collided with."""
+    entries = [_acl_entry(50), _acl_entry(49, action="allow", cidr="0.0.0.0/0")]
+    assert _next_free_ingress_deny_rule_number(entries) == 48
+
+
+def test_next_free_rule_number_ignores_egress_entries():
+    """Egress and ingress rule numbers are independent namespaces; an egress rule must not block ingress."""
+    entries = [_acl_entry(50), _acl_entry(49, egress=True, action="allow", cidr="0.0.0.0/0")]
+    assert _next_free_ingress_deny_rule_number(entries) == 49
+
+
+def test_next_free_rule_number_low_end_exhaustion_falls_back_to_high_range():
+    """When the lowest deny rule is 1, decrementing below it is impossible; search the high end instead."""
+    entries = [_acl_entry(1)]
+    assert _next_free_ingress_deny_rule_number(entries) == 32766
+
+
+def test_next_free_rule_number_low_range_fully_occupied_falls_back_to_high_range():
+    """Even if the preferred slot isn't literally 0, a fully-occupied low range must fall back high."""
+    entries = [_acl_entry(3)] + [_acl_entry(n, action="allow", cidr="0.0.0.0/0") for n in (1, 2)]
+    assert _next_free_ingress_deny_rule_number(entries) == 32766
+
+
+def test_next_free_rule_number_high_range_skips_occupied_slots():
+    """The high-end search must also skip numbers that are already taken."""
+    entries = [_acl_entry(1), _acl_entry(32766, action="allow", cidr="0.0.0.0/0")]
+    assert _next_free_ingress_deny_rule_number(entries) == 32765
+
+
+def test_next_free_rule_number_fully_occupied_nacl_returns_none():
+    """A NACL with every ingress rule number taken must return None so the caller triggers cleanup."""
+    entries = [_acl_entry(n) for n in range(1, 32767)]
+    assert _next_free_ingress_deny_rule_number(entries) is None
+
+
 # --- delete_oldest_acl_entry tests ---
 
 
@@ -351,7 +507,33 @@ def test_delete_oldest_acl_entry_fallback_to_aws(mock_ec2, mock_dynamo):
 
     mock_ec2.delete_network_acl_entry.assert_called_once()
     call_kwargs = mock_ec2.delete_network_acl_entry.call_args[1]
-    assert call_kwargs["RuleNumber"] == 10  # lowest deny rule
+    # New rules get decreasing numbers, so the HIGHEST rule number is the oldest.
+    assert call_kwargs["RuleNumber"] == 20
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_delete_oldest_acl_entry_fallback_excludes_non_gdpatrol_rules(mock_ec2, mock_dynamo):
+    """Only /32 GDPatrol-managed deny rules are candidates for deletion — the implicit
+    default-deny (0.0.0.0/0 @ 32767) and customer subnet-level denies must be left alone."""
+    mock_dynamo.query.return_value = {"Items": []}
+    mock_ec2.describe_network_acls.return_value = {
+        "NetworkAcls": [
+            {
+                "Entries": [
+                    {"Egress": False, "RuleAction": "deny", "RuleNumber": 10, "CidrBlock": "1.2.3.4/32"},
+                    {"Egress": False, "RuleAction": "deny", "RuleNumber": 32767, "CidrBlock": "0.0.0.0/0"},
+                    {"Egress": False, "RuleAction": "deny", "RuleNumber": 5, "CidrBlock": "10.0.0.0/24"},
+                ]
+            }
+        ]
+    }
+
+    delete_oldest_acl_entry("acl-123")
+
+    mock_ec2.delete_network_acl_entry.assert_called_once()
+    call_kwargs = mock_ec2.delete_network_acl_entry.call_args[1]
+    assert call_kwargs["RuleNumber"] == 10  # the only /32 GDPatrol-managed rule
 
 
 @patch("GDPatrol.lambda_function.dynamodb_client")
@@ -372,6 +554,46 @@ def test_delete_oldest_acl_entry_no_deny_rules(mock_ec2, mock_dynamo):
     delete_oldest_acl_entry("acl-123")
 
     mock_ec2.delete_network_acl_entry.assert_not_called()
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_delete_oldest_acl_entry_reconciles_stale_dynamodb_row(mock_ec2, mock_dynamo):
+    """If AWS no longer has the tracked rule, the stale DynamoDB row must still be deleted so it
+    doesn't keep winning as 'oldest' forever."""
+    from botocore.exceptions import ClientError
+
+    mock_dynamo.query.return_value = {
+        "Items": [{"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "1000.0"}, "rule_number": {"S": "50"}}]
+    }
+    mock_ec2.delete_network_acl_entry.side_effect = ClientError(
+        {"Error": {"Code": "InvalidNetworkAclEntry.NotFound", "Message": "not found"}}, "DeleteNetworkAclEntry"
+    )
+
+    delete_oldest_acl_entry("acl-123")
+
+    mock_dynamo.delete_item.assert_called_once_with(
+        TableName="GDPatrol",
+        Key={"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "1000.0"}},
+    )
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_delete_oldest_acl_entry_other_errors_do_not_touch_dynamodb(mock_ec2, mock_dynamo):
+    """A non-NotFound AWS error must not be treated as drift — the DynamoDB row must survive for retry."""
+    from botocore.exceptions import ClientError
+
+    mock_dynamo.query.return_value = {
+        "Items": [{"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "1000.0"}, "rule_number": {"S": "50"}}]
+    }
+    mock_ec2.delete_network_acl_entry.side_effect = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "nope"}}, "DeleteNetworkAclEntry"
+    )
+
+    delete_oldest_acl_entry("acl-123")
+
+    mock_dynamo.delete_item.assert_not_called()
 
 
 # --- Lock tests ---

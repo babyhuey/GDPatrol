@@ -11,6 +11,7 @@ import requests
 import ipaddress
 
 import boto3
+from botocore.exceptions import ClientError
 
 # Use uppercase for environment variable
 slack_web_hook_url = os.environ.get("SLACK_WEB_HOOK_URL")
@@ -166,6 +167,54 @@ def create_network_acl_entry(ip_address: str, nacl_id: str, rule_number: int) ->
         raise
 
 
+def _next_free_ingress_deny_rule_number(entries: List[Dict[str, Any]]) -> int | None:
+    """
+    Return an unused ingress rule number for a new ingress deny rule, or None if the NACL
+    has no free ingress rule numbers left.
+
+    Considers ALL ingress entries (allow and deny) so the result never collides with a
+    pre-existing rule — ingress and egress rule numbers are independent namespaces, so
+    egress entries are ignored.
+
+    Preference order: one below the current lowest GDPatrol deny rule (the existing
+    decrement scheme), or the next free number below that. If the low end (near 1) is
+    exhausted, search downward from the high end (32766; 32767 is the implicit default-deny)
+    instead of evicting whoever holds a fixed slot.
+    """
+    used = {entry["RuleNumber"] for entry in entries if not entry["Egress"]}
+    deny_numbers = [entry["RuleNumber"] for entry in entries if not entry["Egress"] and entry["RuleAction"] == "deny"]
+    start = (min(deny_numbers) - 1) if deny_numbers else 100
+
+    candidate = start
+    while candidate >= 1:
+        if candidate not in used:
+            return candidate
+        candidate -= 1
+
+    # Low end exhausted (or fully occupied); search down from the high end instead.
+    candidate = 32766
+    floor = max(start, 0)
+    while candidate > floor:
+        if candidate not in used:
+            return candidate
+        candidate -= 1
+
+    return None
+
+
+def _create_and_track_deny_rule(ip_address: str, nacl_id: str, rule_number: int) -> None:
+    """Create the deny rule in AWS and record it in DynamoDB so it can be found again as "oldest"."""
+    create_network_acl_entry(ip_address, nacl_id, rule_number)
+    dynamodb_client.put_item(
+        TableName=GD_PATROL_TABLE,
+        Item={
+            "network_acl_id": {"S": nacl_id},
+            "created_at": {"S": str(time.time())},
+            "rule_number": {"S": str(rule_number)},
+        },
+    )
+
+
 def delete_oldest_acl_entry(nacl_id: str) -> None:
     """
     Delete the oldest ACL entry for a given Network ACL ID.
@@ -182,13 +231,18 @@ def delete_oldest_acl_entry(nacl_id: str) -> None:
         if not items:
             logger.warning(f"No entries found in DynamoDB for NACL {nacl_id}. Falling back to AWS NACL entries.")
             nacl = ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]
-            # Only consider deny, ingress rules (Egress=False, RuleAction='deny')
-            deny_rules = [rule for rule in nacl["Entries"] if not rule["Egress"] and rule["RuleAction"] == "deny"]
+            # Only consider GDPatrol-managed rules: ingress deny rules with a /32 CidrBlock.
+            # This excludes the implicit default-deny (0.0.0.0/0 @ 32767) and customer subnet-level denies.
+            deny_rules = [
+                rule
+                for rule in nacl["Entries"]
+                if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
+            ]
             if not deny_rules:
-                logger.warning(f"No deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
+                logger.warning(f"No GDPatrol-managed deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
                 return
-            # Find the oldest by lowest rule number
-            oldest_rule = min(deny_rules, key=lambda r: r["RuleNumber"])
+            # New rules get decreasing numbers, so the HIGHEST rule number is the oldest.
+            oldest_rule = max(deny_rules, key=lambda r: r["RuleNumber"])
             logger.info(f"Deleting fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
             ec2_client.delete_network_acl_entry(
                 Egress=False,
@@ -201,12 +255,19 @@ def delete_oldest_acl_entry(nacl_id: str) -> None:
         oldest_item = items[0]
         logger.info(f"Deleting network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
 
-        ec2_client.delete_network_acl_entry(
-            Egress=False,
-            DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
-            NetworkAclId=nacl_id,
-            RuleNumber=int(oldest_item["rule_number"]["S"]),
-        )
+        try:
+            ec2_client.delete_network_acl_entry(
+                Egress=False,
+                DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
+                NetworkAclId=nacl_id,
+                RuleNumber=int(oldest_item["rule_number"]["S"]),
+            )
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") != "InvalidNetworkAclEntry.NotFound":
+                raise
+            # AWS and DynamoDB have drifted apart; reconcile by removing the stale tracking row below,
+            # instead of leaving it to be returned as "oldest" forever.
+            logger.warning(f"Rule {oldest_item['rule_number']['S']} not found in NACL {nacl_id}; reconciling stale DynamoDB row.")
 
         dynamodb_client.delete_item(
             TableName=GD_PATROL_TABLE,
@@ -358,46 +419,18 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                         logger.error(f"Failed to delete deny rule {rule['RuleNumber']}: {e}")
                 delete_dynamodb_rule_entries(nacl["NetworkAclId"], deleted_rule_numbers)
 
-            if not deny_rules:
-                # If no deny rules exist, start with rule number 100
-                target_rule_number = 100
-            else:
-                # Find the minimum rule number among deny rules
-                min_rule_id = min(rule["RuleNumber"] for rule in deny_rules)
-                # If we hit the lower bound, wrap around to a high rule number (e.g., 32700)
-                if min_rule_id <= 2:
-                    logger.warning(f"Rule number {min_rule_id} is too low; wrapping to 32700 for NACL {nacl['NetworkAclId']}")
-                    target_rule_number = 32700
-                    # Delete any existing rule at 32700 before creating
-                    for rule in nacl["Entries"]:
-                        if not rule["Egress"] and rule["RuleAction"] == "deny" and rule["RuleNumber"] == 32700:
-                            try:
-                                ec2_client.delete_network_acl_entry(
-                                    Egress=False,
-                                    NetworkAclId=nacl["NetworkAclId"],
-                                    RuleNumber=32700,
-                                )
-                                delete_dynamodb_rule_entries(nacl["NetworkAclId"], {32700})
-                                logger.info(f"Deleted existing deny rule 32700 in NACL {nacl['NetworkAclId']}")
-                            except Exception as e:
-                                logger.error(f"Failed to delete existing rule 32700: {e}")
-                    # (Do not continue; proceed to create the new rule at 32700)
-                else:
-                    target_rule_number = min_rule_id - 1
+            target_rule_number = _next_free_ingress_deny_rule_number(nacl["Entries"])
+            if target_rule_number is None:
+                logger.warning(f"No free ingress rule numbers in NACL {nacl['NetworkAclId']}; deleting oldest entry to make room")
+                delete_oldest_acl_entry(nacl["NetworkAclId"])
+                refreshed = ec2_client.describe_network_acls(NetworkAclIds=[nacl["NetworkAclId"]])["NetworkAcls"][0]
+                target_rule_number = _next_free_ingress_deny_rule_number(refreshed["Entries"])
+                if target_rule_number is None:
+                    logger.error(f"NACL {nacl['NetworkAclId']} still has no free ingress rule numbers after cleanup; skipping")
+                    continue
 
             try:
-                create_network_acl_entry(ip_address, nacl["NetworkAclId"], target_rule_number)
-
-                # Store the new entry in DynamoDB
-                dynamodb_client.put_item(
-                    TableName=GD_PATROL_TABLE,
-                    Item={
-                        "network_acl_id": {"S": nacl["NetworkAclId"]},
-                        "created_at": {"S": str(time.time())},
-                        "rule_number": {"S": str(target_rule_number)},
-                    },
-                )
-
+                _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], target_rule_number)
                 logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']}")
                 blocked_count += 1
 
@@ -408,21 +441,35 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                         logger.info(f"Network ACL limit exceeded for {nacl['NetworkAclId']}, attempting to delete oldest entry")
                         delete_oldest_acl_entry(nacl["NetworkAclId"])
                         # Retry creating the entry after deleting the oldest one
-                        create_network_acl_entry(ip_address, nacl["NetworkAclId"], target_rule_number)
-                        # Store the new entry in DynamoDB
-                        dynamodb_client.put_item(
-                            TableName=GD_PATROL_TABLE,
-                            Item={
-                                "network_acl_id": {"S": nacl["NetworkAclId"]},
-                                "created_at": {"S": str(time.time())},
-                                "rule_number": {"S": str(target_rule_number)},
-                            },
-                        )
+                        _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], target_rule_number)
                         logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} after deleting oldest entry")
                         blocked_count += 1
                     except Exception as retry_error:
                         logger.error(f"Failed to create entry after deleting oldest: {retry_error}")
                         # Try the next NACL
+                        continue
+                elif "NetworkAclEntryAlreadyExists" in str(error):
+                    # Our snapshot of the NACL was stale (a concurrent mutation took this number);
+                    # retry with a freshly-computed free number instead of failing outright.
+                    logger.warning(f"Rule number {target_rule_number} already exists in {nacl['NetworkAclId']}; retrying with another")
+                    retried_successfully = False
+                    for _ in range(3):
+                        refreshed = ec2_client.describe_network_acls(NetworkAclIds=[nacl["NetworkAclId"]])["NetworkAcls"][0]
+                        retry_rule_number = _next_free_ingress_deny_rule_number(refreshed["Entries"])
+                        if retry_rule_number is None:
+                            break
+                        try:
+                            _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], retry_rule_number)
+                            logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} at retried rule {retry_rule_number}")
+                            blocked_count += 1
+                            retried_successfully = True
+                            break
+                        except Exception as retry_error:
+                            if "NetworkAclEntryAlreadyExists" not in str(retry_error):
+                                logger.error(f"Failed to create entry at retried rule number: {retry_error}")
+                                break
+                    if not retried_successfully:
+                        logger.error(f"Could not blacklist {ip_address} in NACL {nacl['NetworkAclId']}: no free rule number available")
                         continue
                 else:
                     logger.error(f"Error creating network_acl entry: {error}")
