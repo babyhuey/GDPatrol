@@ -1,6 +1,7 @@
 import pytest
 import json
 import time
+import socket
 from unittest.mock import patch, MagicMock
 import sys
 import os
@@ -27,6 +28,7 @@ from GDPatrol.lambda_function import (
     enable_sg_access,
     asg_detach_instance,
     _next_free_ingress_deny_rule_number,
+    resolve_domain_a_records,
     Config,
     lambda_handler,
 )
@@ -1007,3 +1009,144 @@ def test_lambda_handler_iam_finding(monkeypatch):
         mock_disable.return_value = True
         lambda_handler(event, None)
         mock_disable.assert_called_once_with("baduser")
+
+
+def test_lambda_handler_fractional_severity_crosses_gate(monkeypatch):
+    """A fractional severity like 5.5 must not be truncated to 5, which would under-count the reliability gate."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "severity": 5.5,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "RDSDBInstance",
+            "rdsDbInstanceDetails": {"dbInstanceIdentifier": "testdb", "engine": "mysql"},
+        },
+        "service": {
+            "action": {
+                "actionType": "RDS_LOGIN_ATTEMPT",
+                "rdsLoginAttemptAction": {"remoteIpDetails": {"ipAddressV4": "1.2.3.4"}},
+            },
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "RDS finding",
+    }
+
+    # test_config.json reliability for this type is 5. int(5.5) + 5 = 10, NOT > 10 (bug);
+    # float(5.5) + 5 = 10.5 > 10 (fixed) — must trigger blacklist_ip.
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        mock_blacklist.return_value = True
+        lambda_handler(event, None)
+        mock_blacklist.assert_called_once_with("1.2.3.4")
+
+
+def test_lambda_handler_survives_missing_slack_fields(monkeypatch):
+    """Missing service.count/eventFirstSeen/eventLastSeen must not crash the handler after actions have run."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "severity": 8,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "RDSDBInstance",
+            "rdsDbInstanceDetails": {"dbInstanceIdentifier": "testdb", "engine": "mysql"},
+        },
+        "service": {
+            "action": {
+                "actionType": "RDS_LOGIN_ATTEMPT",
+                "rdsLoginAttemptAction": {"remoteIpDetails": {"ipAddressV4": "1.2.3.4"}},
+            },
+            # count, eventFirstSeen, eventLastSeen intentionally omitted
+        },
+        "description": "RDS finding",
+    }
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=True),
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        lambda_handler(event, None)  # must not raise
+        mock_publish.assert_called_once()
+
+
+def test_lambda_handler_survives_config_load_error():
+    """A missing or malformed config.json must be logged, not crash the invocation."""
+    event = {
+        "id": "test-id",
+        "type": "SomeType",
+        "severity": 8,
+        "service": {"action": {}, "count": 1, "eventFirstSeen": "x", "eventLastSeen": "y"},
+    }
+    with patch("builtins.open", side_effect=FileNotFoundError("config.json missing")):
+        lambda_handler(event, None)  # must not raise
+
+
+# --- resolve_domain_a_records tests ---
+
+
+def test_resolve_domain_a_records_returns_all_unique_ips():
+    """All resolved A records must be returned, not just the first."""
+    fake_results = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.2.3.4", 0)),
+        (socket.AF_INET, socket.SOCK_DGRAM, 17, "", ("1.2.3.4", 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("5.6.7.8", 0)),
+    ]
+    with patch("GDPatrol.lambda_function.socket.getaddrinfo", return_value=fake_results) as mock_getaddrinfo:
+        ips = resolve_domain_a_records("malicious.example.com")
+
+    assert set(ips) == {"1.2.3.4", "5.6.7.8"}
+    mock_getaddrinfo.assert_called_once()
+
+
+def test_resolve_domain_a_records_sets_and_restores_timeout():
+    """A bounded timeout must be applied around resolution, then restored, so a hostile
+    nameserver can't hang the invocation or leak the timeout to unrelated code."""
+    original = socket.getdefaulttimeout()
+    with patch("GDPatrol.lambda_function.socket.getaddrinfo", return_value=[]):
+        resolve_domain_a_records("example.com", timeout=3)
+    assert socket.getdefaulttimeout() == original
+
+
+def test_resolve_domain_a_records_handles_resolution_errors():
+    """DNS failures, including a timeout, must be swallowed, returning no addresses rather than raising."""
+    with patch("GDPatrol.lambda_function.socket.getaddrinfo", side_effect=socket.gaierror("no such host")):
+        assert resolve_domain_a_records("nonexistent.example.com") == []
+
+    with patch("GDPatrol.lambda_function.socket.getaddrinfo", side_effect=socket.timeout("timed out")):
+        assert resolve_domain_a_records("slow.example.com") == []
+
+
+def test_lambda_handler_blacklist_domain_blocks_all_resolved_ips(sample_guardduty_event, monkeypatch):
+    """blacklist_domain must resolve and attempt to block every A record, not just the first."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.resolve_domain_a_records", return_value=["1.2.3.4", "5.6.7.8"]),
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=True) as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        lambda_handler(sample_guardduty_event, None)
+
+        assert mock_blacklist.call_count == 2
+        mock_blacklist.assert_any_call("1.2.3.4")
+        mock_blacklist.assert_any_call("5.6.7.8")

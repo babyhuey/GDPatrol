@@ -4,8 +4,8 @@ import logging
 import os
 import time
 import uuid
+import socket
 from inspect import stack
-from socket import gaierror, gethostbyname
 from typing import Any, Dict, List
 import requests
 import ipaddress
@@ -691,6 +691,24 @@ def asg_detach_instance(instance_id):
         return False
 
 
+def resolve_domain_a_records(domain: str, timeout: float = 5.0) -> List[str]:
+    """
+    Resolve all IPv4 (A record) addresses for a domain, bounded by a timeout so a
+    slow or hostile nameserver can't hang the invocation. Resolution errors are
+    swallowed, returning no addresses rather than raising.
+    """
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        results = socket.getaddrinfo(domain, None, socket.AF_INET)
+        return sorted({result[4][0] for result in results})
+    except OSError as e:
+        logger.error(f"GDPatrol: Error resolving domain {domain} - {e}")
+        return []
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
+
+
 class Config:
     def __init__(self, finding_type: str) -> None:
         self.finding_type = finding_type
@@ -720,13 +738,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             return
         logger.info(f"GDPatrol: Parsed Finding ID: {finding_id} - Finding Type: {finding_type}")
         config = Config(event["type"])
-        severity = int(event.get("severity", 0))
+        severity = float(event.get("severity", 0) or 0)
         count = event.get("service", {}).get("count", 0)
 
         config_actions = config.get_actions()
         config_reliability = config.get_reliability()
         resource_type = event.get("resource", {}).get("resourceType")
-    except KeyError as e:
+    except (KeyError, ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as e:
         logger.error(f"GDPatrol: Could not parse the Finding fields correctly, please verify that the JSON is correct. {e}")
         return
     instance_id = None
@@ -781,12 +799,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             if severity + config_reliability > 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
-                try:
-                    ip_address = gethostbyname(domain)
-                    result = blacklist_ip(ip_address)
-                    successful_actions += int(result)
-                except gaierror as e:
-                    logger.error(f"GDPatrol: Error resolving domain {domain} - {e}")
+                domain_blocked = False
+                for resolved_ip in resolve_domain_a_records(domain):
+                    if blacklist_ip(resolved_ip):
+                        domain_blocked = True
+                successful_actions += int(domain_blocked)
         elif action == "quarantine_instance":
             if severity + config_reliability > 10:
                 actions_to_be_executed += 1
@@ -839,8 +856,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     logger.info(f"GDPatrol: Executed {successful_actions}/{actions_to_be_executed} actions successfully.")
 
     event_summary = summarize_event(event)
-    event_severity = event["severity"]
-    event_count = event["service"]["count"]
+    event_service = event.get("service", {})
+    event_severity = event.get("severity", 0)
+    event_count = event_service.get("count", "N/A")
 
     # Build concise Slack fields from the summary
     fields = [
@@ -848,8 +866,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         {"title": "Account", "value": event_summary.get("account", "N/A"), "short": "true"},
         {"title": "Finding Type", "value": event_summary.get("finding_type", "N/A"), "short": "true"},
         {"title": "Severity", "value": str(event_severity), "short": "true"},
-        {"title": "First Seen", "value": event["service"]["eventFirstSeen"], "short": "true"},
-        {"title": "Last Seen", "value": event["service"]["eventLastSeen"], "short": "true"},
+        {"title": "First Seen", "value": event_service.get("eventFirstSeen", "N/A"), "short": "true"},
+        {"title": "Last Seen", "value": event_service.get("eventLastSeen", "N/A"), "short": "true"},
         {"title": "Count", "value": str(event_count), "short": "true"},
         {"title": "Action Type", "value": event_summary.get("action_type", "N/A"), "short": "true"},
     ]
