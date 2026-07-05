@@ -425,9 +425,7 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                 except Exception as e:
                     logger.error(f"Error querying DynamoDB for NACL {nacl['NetworkAclId']} during cleanup: {e}")
                 # Newest first, so the 10 most recent are kept and the remainder (oldest) are deleted.
-                deny_rules_sorted = sorted(
-                    deny_rules, key=lambda r: created_at_by_rule_number.get(r["RuleNumber"], ""), reverse=True
-                )
+                deny_rules_sorted = sorted(deny_rules, key=lambda r: created_at_by_rule_number.get(r["RuleNumber"], ""), reverse=True)
                 # Keep only the 10 most recent rules
                 rules_to_delete = deny_rules_sorted[10:]
                 deleted_rule_numbers = set()
