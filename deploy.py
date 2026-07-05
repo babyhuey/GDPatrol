@@ -100,12 +100,23 @@ def run(slack_web_hook_url=None):
         lmb = boto3.client("lambda", region_name=region)
         cw_events = boto3.client("events", region_name=region)
         gd = boto3.client("guardduty", region_name=region)
-        if not gd.list_detectors()["DetectorIds"]:
+        detector_ids = gd.list_detectors()["DetectorIds"]
+        if not detector_ids:
             created_detector = gd.create_detector(Enable=True)
             print("Created GuardDuty detector: {}".format(created_detector["DetectorId"]))
         else:
-            gd.update_detector(DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True)
-            print("Detector already exists: {}".format(gd.list_detectors()["DetectorIds"][0]))
+            det_id = detector_ids[0]
+            # Only re-enable if it is actually disabled, and tolerate member/delegated-admin
+            # accounts where the member cannot manage detector enablement (the GuardDuty
+            # administrator account owns it) — update_detector raises BadRequestException there.
+            try:
+                if gd.get_detector(DetectorId=det_id).get("Status") != "ENABLED":
+                    gd.update_detector(DetectorId=det_id, Enable=True)
+                    print("Re-enabled GuardDuty detector: {}".format(det_id))
+                else:
+                    print("Detector already enabled: {}".format(det_id))
+            except Exception as e:
+                print("Could not manage detector {} (enablement may be org-managed): {}".format(det_id, e))
 
         sleep(7)  # Lambda bug: create function right after the role is created will cause AccessDeniedExceptionKMS error
         # A freshly created IAM role can take a while to propagate, and
