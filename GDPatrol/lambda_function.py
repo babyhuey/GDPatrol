@@ -18,6 +18,9 @@ slack_web_hook_url = os.environ.get("SLACK_WEB_HOOK_URL")
 # Use environment variables for table names
 GD_PATROL_TABLE = os.environ.get("GD_PATROL_TABLE", "GDPatrol")
 GD_PATROL_LOCK_TABLE = os.environ.get("GD_PATROL_LOCK_TABLE", "GDPatrol_lock")
+# All NACL-mutating actions serialize on this single lock id, since blacklist_ip/whitelist_ip
+# each mutate every NACL in the account rather than just one keyed by IP.
+GD_PATROL_NACL_LOCK_ID = "gdpatrol-nacl"
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -218,7 +221,7 @@ def delete_oldest_acl_entry(nacl_id: str) -> None:
         # Do not raise here; just log the error and continue
 
 
-def acquire_lock(lock_table_name: str, lock_id: str, max_retries: int = 5, retry_delay: int = 2, ttl_seconds: int = 60) -> None:
+def acquire_lock(lock_table_name: str, lock_id: str, max_retries: int = 60, retry_delay: int = 3, ttl_seconds: int = 60) -> None:
     """
     Acquire a lock from a DynamoDB table. Adds a TTL to avoid deadlocks.
     """
@@ -301,8 +304,9 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
     # Use env table names if not provided
     lock_table_name = lock_table_name or GD_PATROL_LOCK_TABLE
-    # Make lock_id resource-specific
-    lock_id = lock_id or f"lock-{ip_address}"
+    # A single fixed lock id, since this function mutates every NACL in the account,
+    # not just resources related to ip_address.
+    lock_id = lock_id or GD_PATROL_NACL_LOCK_ID
     lock_acquired = False
     try:
         acquire_lock(lock_table_name, lock_id)
@@ -438,7 +442,11 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
 
 def whitelist_ip(ip_address):
+    lock_acquired = False
     try:
+        acquire_lock(GD_PATROL_LOCK_TABLE, GD_PATROL_NACL_LOCK_ID)
+        lock_acquired = True
+
         paginator = ec2_client.get_paginator("describe_network_acls")
         for page in paginator.paginate():
             for nacl in page["NetworkAcls"]:
@@ -459,6 +467,9 @@ def whitelist_ip(ip_address):
     except Exception as e:
         logger.error(f"GDPatrol: Error executing {stack()[0][3]} - {e}")
         return False
+    finally:
+        if lock_acquired:
+            release_lock(GD_PATROL_LOCK_TABLE, GD_PATROL_NACL_LOCK_ID)
 
 
 def quarantine_instance(instance_id, vpc_id):

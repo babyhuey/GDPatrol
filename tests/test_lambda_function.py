@@ -1,5 +1,6 @@
 import pytest
 import json
+import time
 from unittest.mock import patch, MagicMock
 import sys
 import os
@@ -390,14 +391,71 @@ def test_acquire_and_release_lock(mock_dynamo):
     mock_dynamo.delete_item.assert_called_once()
 
 
+@patch("GDPatrol.lambda_function.time.sleep", return_value=None)
+@patch("GDPatrol.lambda_function.dynamodb_client")
+def test_acquire_lock_queues_through_a_burst(mock_dynamo, mock_sleep):
+    """A burst of contention must queue past the old 5-attempt budget instead of failing to acquire."""
+    busy_attempts = 10  # more than the old default max_retries of 5
+    call_count = {"n": 0}
+
+    def get_item_side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] <= busy_attempts:
+            return {"Item": {"timestamp": {"S": str(int(time.time()))}}}
+        return {}
+
+    mock_dynamo.get_item.side_effect = get_item_side_effect
+    mock_dynamo.exceptions = MagicMock()
+    mock_dynamo.exceptions.ConditionalCheckFailedException = type("ConditionalCheckFailedException", (Exception,), {})
+
+    acquire_lock("GDPatrol_lock", "gdpatrol-nacl")
+
+    mock_dynamo.put_item.assert_called_once()
+
+
+@patch("GDPatrol.lambda_function.release_lock")
+@patch("GDPatrol.lambda_function.acquire_lock")
+def test_blacklist_ip_uses_shared_lock_id(mock_acquire, mock_release):
+    """Two different IPs must serialize on the SAME lock id, not per-IP locks, since blacklist_ip mutates every NACL."""
+    mock_acquire.side_effect = Exception("boom")
+    blacklist_ip("10.0.0.1")
+    blacklist_ip("10.0.0.2")
+
+    lock_ids_used = {call.args[1] for call in mock_acquire.call_args_list}
+    assert lock_ids_used == {"gdpatrol-nacl"}
+
+
+@patch("GDPatrol.lambda_function.release_lock")
+@patch("GDPatrol.lambda_function.acquire_lock")
+def test_whitelist_ip_uses_lock(mock_acquire, mock_release, mock_ec2_client):
+    """whitelist_ip must serialize its NACL mutations under the same shared lock as blacklist_ip."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+
+    whitelist_ip("192.168.1.1")
+
+    mock_acquire.assert_called_once_with(os.environ.get("GD_PATROL_LOCK_TABLE", "GDPatrol_lock"), "gdpatrol-nacl")
+    mock_release.assert_called_once()
+
+
+@patch("GDPatrol.lambda_function.release_lock")
+@patch("GDPatrol.lambda_function.acquire_lock")
+def test_whitelist_ip_no_release_when_acquire_fails(mock_acquire, mock_release):
+    """A failed acquire_lock must not release another invocation's lock."""
+    mock_acquire.side_effect = Exception("Unable to acquire lock after multiple attempts")
+    assert whitelist_ip("198.51.100.1") is False
+    mock_release.assert_not_called()
+
+
 # --- whitelist_ip tests ---
 
 
-def test_whitelist_ip(mock_ec2_client):
+def test_whitelist_ip(mock_ec2_client, mock_dynamodb_client):
     """Test whitelisting (removing) an IP from NACLs."""
     vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
     nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
     nacl_id = nacl["NetworkAcl"]["NetworkAclId"]
+    create_lock_table(mock_dynamodb_client)
 
     # Add a deny rule first
     mock_ec2_client.create_network_acl_entry(
