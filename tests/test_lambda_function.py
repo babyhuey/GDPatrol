@@ -8,6 +8,7 @@ from pathlib import Path
 # Add the parent directory to sys.path to import the lambda function
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from GDPatrol.lambda_function import (
+    summarize_event,
     enhance_message_with_claude,
     publish_message,
     create_network_acl_entry,
@@ -678,6 +679,7 @@ def test_real_config_json_integrity(monkeypatch):
         "Backdoor:Lambda/C&CActivity.B": ["blacklist_ip"],
         "Trojan:Runtime/DGADomainRequest.C!DNS": ["blacklist_domain"],
         "Execution:EC2/MaliciousFile": ["quarantine_instance", "snapshot_instance", "asg_detach_instance"],
+        "CredentialAccess:Kubernetes/MaliciousIPCaller": ["blacklist_ip"],
     }
     for finding_type, expected in expected_actions_by_type.items():
         assert finding_type in by_type, f"missing finding type {finding_type!r}"
@@ -688,3 +690,69 @@ def test_real_config_json_integrity(monkeypatch):
     for finding_type, expected in expected_actions_by_type.items():
         config = Config(finding_type)
         assert config.get_actions() == expected
+
+
+# --- KUBERNETES_API_CALL extraction ---
+
+
+def test_summarize_event_kubernetes_api_call():
+    """summarize_event must extract the remote IP for KUBERNETES_API_CALL findings."""
+    event = {
+        "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+        "severity": 8,
+        "service": {
+            "action": {
+                "actionType": "KUBERNETES_API_CALL",
+                "kubernetesApiCallAction": {
+                    "remoteIpDetails": {"ipAddressV4": "198.51.100.42"},
+                },
+            }
+        },
+    }
+    summary = summarize_event(event)
+    assert summary["source_ip"] == "198.51.100.42"
+
+
+def test_lambda_handler_kubernetes_finding(monkeypatch):
+    """Test lambda handler extracts the IP from a KUBERNETES_API_CALL event and dispatches blacklist_ip."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-k8s-id",
+        "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+        "severity": 8,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {"resourceType": "Kubernetes"},
+        "service": {
+            "action": {
+                "actionType": "KUBERNETES_API_CALL",
+                "kubernetesApiCallAction": {
+                    "remoteIpDetails": {"ipAddressV4": "198.51.100.42"},
+                },
+            },
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "Kubernetes API call from known malicious IP",
+    }
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        config_data = json.loads(test_config_path.read_text())
+        config_data["playbooks"]["playbook"].append(
+            {
+                "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+                "actions": ["blacklist_ip"],
+                "reliability": 5,
+            }
+        )
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        mock_blacklist.return_value = True
+        lambda_handler(event, None)
+        mock_blacklist.assert_called_once_with("198.51.100.42")

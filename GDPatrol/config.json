@@ -911,6 +911,111 @@
           "asg_detach_instance"
         ],
         "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:Kubernetes/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:Kubernetes/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:Kubernetes/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:Kubernetes/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:Kubernetes/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:Kubernetes/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:Kubernetes/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:Kubernetes/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Kubernetes/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Kubernetes/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Kubernetes/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Persistence:Kubernetes/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Persistence:Kubernetes/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Persistence:Kubernetes/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
       }
     ]
   }
