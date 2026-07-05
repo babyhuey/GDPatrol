@@ -1135,6 +1135,29 @@ def test_lambda_handler_string_severity_does_not_crash_notify(monkeypatch):
         mock_publish.assert_called_once()
 
 
+def test_lambda_policy_grants_ec2_actions_the_code_calls():
+    """The execution policy must grant every EC2 mutating action the remediation code calls.
+    Guards against a code change (e.g. the multi-ENI quarantine switching to
+    modify_network_interface_attribute) that the IAM policy isn't updated to match --
+    a gap moto can't catch because it doesn't enforce IAM."""
+    policy = json.loads((Path(__file__).parent.parent / "lambda_policy.json").read_text())
+    granted = set()
+    for stmt in policy["Statement"]:
+        actions = stmt["Action"]
+        granted.update(actions if isinstance(actions, list) else [actions])
+    required = {
+        "ec2:CreateSecurityGroup",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:ModifyNetworkInterfaceAttribute",
+        "ec2:CreateSnapshot",
+        "ec2:CreateNetworkAclEntry",
+        "ec2:DeleteNetworkAclEntry",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkAcls",
+    }
+    assert not (required - granted), f"lambda_policy.json missing required actions: {required - granted}"
+
+
 def test_lambda_handler_survives_config_load_error():
     """A missing or malformed config.json must be logged, not crash the invocation."""
     event = {

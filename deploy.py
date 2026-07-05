@@ -3,7 +3,6 @@ import subprocess
 import tempfile
 from os import environ, remove
 from pathlib import Path
-from random import randrange
 from shutil import copy2, copytree, make_archive, rmtree
 from time import sleep
 import boto3
@@ -165,15 +164,19 @@ def run(slack_web_hook_url=None):
             Targets=[{"Id": target_id, "Arn": target_arn, "InputPath": "$.detail"}],
         )
 
-        # We are adding the trigger to the Lambda function so that it will be invoked every time  a finding is sent over
-        statement_id = str(randrange(10**11, 10**12))
-        lmb.add_permission(
-            FunctionName=lambda_response["FunctionName"],
-            StatementId=statement_id,
-            Action="lambda:InvokeFunction",
-            Principal="events.amazonaws.com",
-            SourceArn=created_rule["RuleArn"],
-        )
+        # Stable StatementId so redeploys don't accumulate duplicate resource-policy
+        # statements toward Lambda's policy-size limit.
+        try:
+            lmb.add_permission(
+                FunctionName=lambda_response["FunctionName"],
+                StatementId="GDPatrolEventBridgeInvoke",
+                Action="lambda:InvokeFunction",
+                Principal="events.amazonaws.com",
+                SourceArn=created_rule["RuleArn"],
+            )
+        except lmb.exceptions.ResourceConflictException:
+            # Permission already present from a prior deploy — idempotent.
+            pass
         print("Successfully deployed the GDPatrol lambda function in region {}.".format(str(region)))
 
         # Create DynamoDB table if not existed
