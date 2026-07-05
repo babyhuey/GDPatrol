@@ -395,15 +395,40 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                 blocked_count += 1
                 continue
 
-            # Get all deny rules for this NACL
-            deny_rules = [rule for rule in nacl["Entries"] if not rule["Egress"] and rule["RuleAction"] == "deny"]
+            # Get all deny rules for this NACL. Only GDPatrol-managed rules (ingress deny with a
+            # /32 CidrBlock) count toward the threshold and are eligible for cleanup — this must
+            # never sweep up a customer's own deny rule (e.g. a subnet-level block, or the implicit
+            # default-deny at 32767). Same predicate as delete_oldest_acl_entry's fallback.
+            deny_rules = [
+                rule
+                for rule in nacl["Entries"]
+                if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
+            ]
 
             # Check if we're approaching the limit (max 20 rules per direction)
             if len(deny_rules) >= 19:
                 logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, performing aggressive cleanup.")
-                # New rules get decreasing numbers (min - 1), so the lowest rule numbers are the most recent
-                deny_rules_sorted = sorted(deny_rules, key=lambda r: r["RuleNumber"])
-                # Keep only the 10 most recent (lowest) rule numbers
+                # Rule numbers no longer indicate age once the allocator falls back to the high end,
+                # so order by the DynamoDB created_at tracking data instead. Rules with no tracking
+                # row have drifted from DynamoDB; treat them as oldest (safe to evict first) via the
+                # "" sentinel, which sorts before any real timestamp string.
+                created_at_by_rule_number: Dict[int, str] = {}
+                try:
+                    tracking = dynamodb_client.query(
+                        TableName=GD_PATROL_TABLE,
+                        KeyConditionExpression="#pk = :pk_value",
+                        ExpressionAttributeNames={"#pk": "network_acl_id"},
+                        ExpressionAttributeValues={":pk_value": {"S": nacl["NetworkAclId"]}},
+                    )
+                    for item in tracking.get("Items", []):
+                        created_at_by_rule_number[int(item["rule_number"]["S"])] = item["created_at"]["S"]
+                except Exception as e:
+                    logger.error(f"Error querying DynamoDB for NACL {nacl['NetworkAclId']} during cleanup: {e}")
+                # Newest first, so the 10 most recent are kept and the remainder (oldest) are deleted.
+                deny_rules_sorted = sorted(
+                    deny_rules, key=lambda r: created_at_by_rule_number.get(r["RuleNumber"], ""), reverse=True
+                )
+                # Keep only the 10 most recent rules
                 rules_to_delete = deny_rules_sorted[10:]
                 deleted_rule_numbers = set()
                 for rule in rules_to_delete:

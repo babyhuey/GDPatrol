@@ -376,6 +376,73 @@ def test_blacklist_ip_low_end_exhaustion_does_not_evict(mock_ec2_client, mock_dy
     assert new_rule["RuleNumber"] == 32766
 
 
+def test_blacklist_ip_aggressive_cleanup_never_deletes_customer_rule(mock_ec2_client, mock_dynamodb_client):
+    """Aggressive cleanup must only ever consider GDPatrol-managed (/32 ingress deny) rules —
+    a customer's own deny rule (e.g. a subnet-level block) must never be swept up, even when it
+    pushes the NACL's total deny-rule count over the cleanup threshold."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    nacl_id = nacl["NetworkAcl"]["NetworkAclId"]
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    # Customer's own subnet-level deny rule — GDPatrol must never touch this.
+    mock_ec2_client.create_network_acl_entry(
+        CidrBlock="10.0.0.0/24", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=500
+    )
+    # 19 GDPatrol-managed /32 deny rules, enough to trigger the aggressive-cleanup threshold.
+    for i in range(1, 20):
+        mock_ec2_client.create_network_acl_entry(
+            CidrBlock=f"10.1.0.{i}/32", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=i
+        )
+
+    assert blacklist_ip("203.0.113.50") is True
+
+    entries = mock_ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]["Entries"]
+    assert any(e["RuleNumber"] == 500 and e.get("CidrBlock") == "10.0.0.0/24" for e in entries), (
+        "customer's own deny rule was swept up by aggressive cleanup"
+    )
+
+
+def test_blacklist_ip_aggressive_cleanup_orders_by_created_at_not_rule_number(mock_ec2_client, mock_dynamodb_client):
+    """Aggressive cleanup must evict the oldest rules by DynamoDB created_at, not by rule number —
+    the allocator can hand a high rule number to a brand-new rule once the low range is exhausted,
+    so 'lowest rule number' no longer means 'newest'."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    nacl = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    nacl_id = nacl["NetworkAcl"]["NetworkAclId"]
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+
+    def add_tracked_rule(rule_number, created_at, cidr):
+        mock_ec2_client.create_network_acl_entry(
+            CidrBlock=cidr, Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=rule_number
+        )
+        mock_dynamodb_client.put_item(
+            TableName="GDPatrol",
+            Item={
+                "network_acl_id": {"S": nacl_id},
+                "created_at": {"S": created_at},
+                "rule_number": {"S": str(rule_number)},
+            },
+        )
+
+    # Oldest rule holds a LOW rule number.
+    add_tracked_rule(5, "1.0", "10.1.0.5/32")
+    # Newest rule holds a HIGH rule number, as the allocator hands out once the low range is exhausted.
+    add_tracked_rule(32760, "300.0", "10.1.0.250/32")
+    # 17 filler rules in between, to reach the 19-rule cleanup threshold.
+    for i in range(17):
+        add_tracked_rule(101 + i, str(200 + i), f"10.1.1.{i}/32")
+
+    assert blacklist_ip("203.0.113.60") is True
+
+    entries = mock_ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]["Entries"]
+    rule_numbers = {e["RuleNumber"] for e in entries if not e["Egress"] and e["RuleAction"] == "deny"}
+    assert 32760 in rule_numbers, "newest rule (high rule number) was wrongly evicted"
+    assert 5 not in rule_numbers, "oldest rule (low rule number) should have been evicted, not kept"
+
+
 @patch("GDPatrol.lambda_function.dynamodb_client")
 @patch("GDPatrol.lambda_function.delete_oldest_acl_entry")
 @patch("GDPatrol.lambda_function.create_network_acl_entry")
