@@ -1,7 +1,13 @@
+import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+# deploy.py lives at the repo root; make it importable however pytest is invoked
+# (CI runs the pytest console script, so the repo root isn't auto-added to sys.path).
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import deploy
 
