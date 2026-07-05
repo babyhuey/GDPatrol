@@ -924,6 +924,97 @@ def test_root_is_always_protected():
     assert "root" in PROTECTED_USERS
 
 
+def _published_field(mock_publish, title):
+    """Extract a Slack field value from the payload passed to publish_message."""
+    payload = json.loads(mock_publish.call_args[0][1])
+    for f in payload["attachments"][0]["fields"]:
+        if f["title"] == title:
+            return f["value"]
+    return None
+
+
+def _rds_ip_event(finding_type, severity):
+    return {
+        "id": "t",
+        "type": finding_type,
+        "severity": severity,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {"resourceType": "RDSDBInstance", "rdsDbInstanceDetails": {"dbInstanceIdentifier": "db", "engine": "mysql"}},
+        "service": {
+            "action": {"actionType": "RDS_LOGIN_ATTEMPT", "rdsLoginAttemptAction": {"remoteIpDetails": {"ipAddressV4": "203.0.113.5"}}},
+            "count": 1,
+            "eventFirstSeen": "x",
+            "eventLastSeen": "y",
+        },
+        "description": "d",
+    }
+
+
+def test_slack_fields_remediated(monkeypatch):
+    """A fully-executed playbook yields Status 'remediated' and a concrete Auto-remediation line."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+    event = _rds_ip_event("TestIPFinding", 8)
+    config_data = {"playbooks": {"playbook": [{"type": "TestIPFinding", "actions": ["blacklist_ip"], "reliability": 5}]}}
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=True),
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+    assert _published_field(mock_publish, "Status") == "remediated"
+    auto = _published_field(mock_publish, "Auto-remediation")
+    assert "blacklist_ip" in auto and "203.0.113.5" in auto and "completed" in auto
+
+
+def test_slack_fields_needs_review(monkeypatch):
+    """A playbook that doesn't fully fire (below the gate) yields Status 'needs-review'."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+    # sev 6 disable_account: below the strict gate (needs sev >= 7), so it does not fire.
+    event = {
+        "id": "t",
+        "type": "TestIAMFinding",
+        "severity": 6,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {"resourceType": "AccessKey", "accessKeyDetails": {"userName": "baduser"}},
+        "service": {
+            "action": {"actionType": "AWS_API_CALL", "awsApiCallAction": {}},
+            "count": 1,
+            "eventFirstSeen": "x",
+            "eventLastSeen": "y",
+        },
+        "description": "d",
+    }
+    config_data = {"playbooks": {"playbook": [{"type": "TestIAMFinding", "actions": ["disable_account"], "reliability": 10}]}}
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.disable_account") as mock_disable,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+        mock_disable.assert_not_called()
+    assert _published_field(mock_publish, "Status") == "needs-review"
+    assert "below action threshold or protected target" in _published_field(mock_publish, "Auto-remediation")
+
+
+def test_slack_fields_no_playbook(monkeypatch):
+    """A finding type with no playbook yields Status 'no-playbook' and no auto-remediation."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+    event = _rds_ip_event("UnconfiguredFinding", 8)
+    config_data = {"playbooks": {"playbook": []}}
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+    assert _published_field(mock_publish, "Status") == "no-playbook"
+    assert "no playbook" in _published_field(mock_publish, "Auto-remediation")
+
+
 def test_disable_ec2_access(aws_credentials):
     """Test disabling EC2 access for a user."""
     import boto3
