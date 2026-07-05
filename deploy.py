@@ -74,6 +74,9 @@ def run(slack_web_hook_url=None):
         for role in response["Roles"]:
             if role["RoleName"] == "GDPatrolRole":
                 lambda_role_arn = role["Arn"]
+                break
+        if lambda_role_arn is not None:
+            break
 
     if lambda_role_arn is None:
         created_role = iam.create_role(RoleName="GDPatrolRole", AssumeRolePolicyDocument=assume_role_policy)
@@ -129,6 +132,10 @@ def run(slack_web_hook_url=None):
                     FunctionName="GDPatrol",
                     ZipFile=open(zipped, "rb").read(),
                 )
+                # update_function_code leaves the function InProgress for a few
+                # seconds; update_function_configuration raises ResourceConflict
+                # if called before it settles.
+                lmb.get_waiter("function_updated").wait(FunctionName="GDPatrol")
                 lmb.update_function_configuration(
                     FunctionName="GDPatrol",
                     Runtime=LAMBDA_RUNTIME,
@@ -145,7 +152,9 @@ def run(slack_web_hook_url=None):
                 print("Role not yet assumable in region {}, retrying...".format(str(region)))
                 sleep(10)
         target_arn = lambda_response["FunctionArn"]
-        target_id = "Id" + str(randrange(10**11, 10**12))
+        # Stable target Id so put_targets replaces the same target on each redeploy
+        # instead of accumulating toward EventBridge's hard limit of 5 targets/rule.
+        target_id = "GDPatrolTarget"
 
         created_rule = cw_events.put_rule(
             Name="GDPatrol",
