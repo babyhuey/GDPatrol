@@ -400,6 +400,517 @@
           "blacklist_ip"
         ],
         "reliability": 5
+      },
+      {
+        "type": "Discovery:S3/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:S3/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:S3/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Exfiltration:S3/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:S3/MaliciousIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:S3/TorIPCaller",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:S3/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:IAMUser/BedrockLoggingDisabled",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Discovery:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Exfiltration:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "InitialAccess:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "PenTest:IAMUser/ParrotLinux",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "PenTest:IAMUser/PentooLinux",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Persistence:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "PrivilegeEscalation:IAMUser/AnomalousBehavior",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.InsideAWS",
+        "actions": [
+          "disable_account"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CredentialAccess:IAMUser/CompromisedCredentials",
+        "actions": [
+          "disable_account",
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration.OutsideAWS",
+        "actions": [
+          "disable_account",
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:IAMUser/ResourceCredentialExfiltration.OutsideAWS",
+        "actions": [
+          "disable_account",
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/C&CActivity.B",
+        "actions": [
+          "blacklist_ip",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CryptoCurrency:EC2/BitcoinTool.B",
+        "actions": [
+          "blacklist_ip",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:EC2/UnusualDNSResolver",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:EC2/UnusualDoHActivity",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "DefenseEvasion:EC2/UnusualDoTActivity",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/WinRMBruteForce",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Recon:EC2/PortProbeEMRUnprotectedPort",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/DenialOfService.Dns",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/DenialOfService.Tcp",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/DenialOfService.Udp",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/DenialOfService.UdpOnTcpPorts",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:EC2/DenialOfService.UnusualProtocol",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/PortSweep",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/AbusedDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/MaliciousDomainRequest.Custom",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/BitcoinDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/MaliciousDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:EC2/SuspiciousDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 3
+      },
+      {
+        "type": "UnauthorizedAccess:EC2/TorClient",
+        "actions": [
+          "blacklist_ip",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:EC2/TorRelay",
+        "actions": [
+          "blacklist_ip",
+          "asg_detach_instance",
+          "quarantine_instance",
+          "snapshot_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:Lambda/C&CActivity.B",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CryptoCurrency:Lambda/BitcoinTool.B",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Lambda/BlackholeTraffic",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Lambda/DropPoint",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:Lambda/MaliciousIPCaller.Custom",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:Lambda/TorClient",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:Lambda/TorRelay",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:Runtime/C&CActivity.B",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CryptoCurrency:Runtime/BitcoinTool.B",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/BlackholeTraffic",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/DropPoint",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:Runtime/TorClient",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "UnauthorizedAccess:Runtime/TorRelay",
+        "actions": [
+          "blacklist_ip"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Backdoor:Runtime/C&CActivity.B!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "CryptoCurrency:Runtime/BitcoinTool.B!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/BlackholeTraffic!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/DropPoint!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/DGADomainRequest.C!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/DriveBySourceTraffic!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Trojan:Runtime/PhishingDomainRequest!DNS",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Runtime/AbusedDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Runtime/BitcoinDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Runtime/MaliciousDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Impact:Runtime/SuspiciousDomainRequest.Reputation",
+        "actions": [
+          "blacklist_domain"
+        ],
+        "reliability": 3
+      },
+      {
+        "type": "Execution:EC2/MaliciousFile",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
+      },
+      {
+        "type": "Execution:EC2/SuspiciousFile",
+        "actions": [
+          "quarantine_instance",
+          "snapshot_instance",
+          "asg_detach_instance"
+        ],
+        "reliability": 5
       }
     ]
   }

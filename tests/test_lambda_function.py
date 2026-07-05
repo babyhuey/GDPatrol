@@ -631,3 +631,60 @@ def test_lambda_handler_iam_finding(monkeypatch):
         mock_disable.return_value = True
         lambda_handler(event, None)
         mock_disable.assert_called_once_with("baduser")
+
+
+# --- Real config.json integrity ---
+
+# Pre-existing entries that use disable_sg_access/disable_ec2_access — implemented and dispatched in
+# lambda_handler, but outside the 6 actions this coverage work adds new entries with. Left untouched.
+LEGACY_NON_STANDARD_ACTION_TYPES = {
+    "Persistence:IAMUser/NetworkPermissions",
+    "Recon:IAMUser/NetworkPermissions",
+    "ResourceConsumption:IAMUser/ComputeResources",
+}
+
+
+def test_real_config_json_integrity(monkeypatch):
+    """The real GDPatrol/config.json must be valid JSON, have no duplicate finding types, and every
+    newly-added entry must use only the 6 actions lambda_handler actually dispatches. A representative
+    sample of the new finding types must resolve via the Config class to the expected action list."""
+    real_config_path = Path(__file__).parent.parent / "GDPatrol" / "config.json"
+    data = json.loads(real_config_path.read_text())
+
+    playbook = data["playbooks"]["playbook"]
+    types = [p["type"] for p in playbook]
+    assert len(types) == len(set(types)), "duplicate finding types in config.json"
+
+    valid_actions = {
+        "blacklist_ip",
+        "blacklist_domain",
+        "quarantine_instance",
+        "snapshot_instance",
+        "asg_detach_instance",
+        "disable_account",
+    }
+    for p in playbook:
+        if p["type"] in LEGACY_NON_STANDARD_ACTION_TYPES:
+            continue
+        actions = p["actions"] if isinstance(p["actions"], list) else [p["actions"]]
+        for action in actions:
+            assert action in valid_actions, f"unimplemented action {action!r} for finding type {p['type']!r}"
+
+    by_type = {p["type"]: p for p in playbook}
+    expected_actions_by_type = {
+        "Discovery:S3/MaliciousIPCaller": ["blacklist_ip"],
+        "CredentialAccess:IAMUser/CompromisedCredentials": ["disable_account", "blacklist_ip"],
+        "Backdoor:EC2/DenialOfService.Tcp": ["quarantine_instance", "snapshot_instance", "asg_detach_instance"],
+        "Backdoor:Lambda/C&CActivity.B": ["blacklist_ip"],
+        "Trojan:Runtime/DGADomainRequest.C!DNS": ["blacklist_domain"],
+        "Execution:EC2/MaliciousFile": ["quarantine_instance", "snapshot_instance", "asg_detach_instance"],
+    }
+    for finding_type, expected in expected_actions_by_type.items():
+        assert finding_type in by_type, f"missing finding type {finding_type!r}"
+
+    # Config.__init__ opens "config.json" relatively — chdir into GDPatrol/ so it reads the real file
+    # (not mocked), matching the layout of the deployed Lambda package.
+    monkeypatch.chdir(real_config_path.parent)
+    for finding_type, expected in expected_actions_by_type.items():
+        config = Config(finding_type)
+        assert config.get_actions() == expected
