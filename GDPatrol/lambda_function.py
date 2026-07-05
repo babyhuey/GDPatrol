@@ -489,11 +489,18 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
 
 def whitelist_ip(ip_address):
+    try:
+        ipaddress.ip_address(ip_address)
+    except ValueError:
+        logger.error(f"Invalid IP address: {ip_address}")
+        return False
+
     lock_acquired = False
     try:
         acquire_lock(GD_PATROL_LOCK_TABLE, GD_PATROL_NACL_LOCK_ID)
         lock_acquired = True
 
+        removed_count = 0
         paginator = ec2_client.get_paginator("describe_network_acls")
         for page in paginator.paginate():
             for nacl in page["NetworkAcls"]:
@@ -505,9 +512,14 @@ def whitelist_ip(ip_address):
                             Egress=rule["Egress"],
                             RuleNumber=rule["RuleNumber"],
                         )
+                        removed_count += 1
                         if not rule["Egress"]:
                             removed_rule_numbers.add(rule["RuleNumber"])
                 delete_dynamodb_rule_entries(nacl["NetworkAclId"], removed_rule_numbers)
+
+        if removed_count == 0:
+            logger.warning(f"GDPatrol: No matching rules found to whitelist {ip_address}")
+            return False
         logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}")
         return True
 
@@ -544,8 +556,12 @@ def quarantine_instance(instance_id, vpc_id):
             ],
         )
 
-        # NOTE: Assign security group to instance
-        client.modify_instance_attribute(InstanceId=instance_id, Groups=[sg_id])
+        # NOTE: Assign the security group to every ENI — modify_instance_attribute only
+        # touches the primary interface, leaving other ENIs unisolated.
+        instance_described = client.describe_instances(InstanceIds=[instance_id])
+        network_interfaces = instance_described["Reservations"][0]["Instances"][0]["NetworkInterfaces"]
+        for eni in network_interfaces:
+            client.modify_network_interface_attribute(NetworkInterfaceId=eni["NetworkInterfaceId"], Groups=[sg_id])
 
         logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}")
         return True
@@ -651,20 +667,23 @@ def enable_sg_access(username):
 
 
 def asg_detach_instance(instance_id):
+    if not instance_id:
+        logger.error(f"GDPatrol: {stack()[0][3]} called without an instance_id")
+        return False
     try:
         client = boto3.client("autoscaling")
         response = client.describe_auto_scaling_instances(InstanceIds=[instance_id], MaxRecords=1)
-        asg_name = None
         instances = response["AutoScalingInstances"]
-        if instances:
-            asg_name = instances[0]["AutoScalingGroupName"]
+        if not instances:
+            logger.warning(f"GDPatrol: {instance_id} is not a member of any Auto Scaling Group; nothing to detach")
+            return False
 
-        if asg_name is not None:
-            response = client.detach_instances(
-                InstanceIds=[instance_id],
-                AutoScalingGroupName=asg_name,
-                ShouldDecrementDesiredCapacity=False,
-            )
+        asg_name = instances[0]["AutoScalingGroupName"]
+        client.detach_instances(
+            InstanceIds=[instance_id],
+            AutoScalingGroupName=asg_name,
+            ShouldDecrementDesiredCapacity=False,
+        )
         logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}")
         return True
     except Exception as e:

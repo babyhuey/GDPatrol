@@ -25,6 +25,7 @@ from GDPatrol.lambda_function import (
     enable_ec2_access,
     disable_sg_access,
     enable_sg_access,
+    asg_detach_instance,
     _next_free_ingress_deny_rule_number,
     Config,
     lambda_handler,
@@ -697,6 +698,20 @@ def test_whitelist_ip(mock_ec2_client, mock_dynamodb_client):
     assert not any(e.get("CidrBlock") == "192.168.1.1/32" and e["RuleAction"] == "deny" for e in entries)
 
 
+def test_whitelist_ip_invalid_ip_returns_false():
+    """An invalid IP must be rejected before touching any NACLs."""
+    assert whitelist_ip("not-an-ip") is False
+
+
+def test_whitelist_ip_no_matching_rules_returns_false(mock_ec2_client, mock_dynamodb_client):
+    """Whitelisting an IP with no matching rule anywhere is a no-op and must return False, not True."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])
+    create_lock_table(mock_dynamodb_client)
+
+    assert whitelist_ip("203.0.113.200") is False
+
+
 # --- IAM action tests ---
 
 
@@ -797,10 +812,36 @@ def test_quarantine_instance(mock_ec2_client):
     result = quarantine_instance(instance_id, vpc["Vpc"]["VpcId"])
     assert result is True
 
-    # Verify instance has a quarantine security group
+    # Verify the instance's (only) network interface has the quarantine security group
     instance_desc = mock_ec2_client.describe_instances(InstanceIds=[instance_id])
-    sgs = instance_desc["Reservations"][0]["Instances"][0]["SecurityGroups"]
-    assert any("Quarantine" in sg["GroupName"] for sg in sgs)
+    nics = instance_desc["Reservations"][0]["Instances"][0]["NetworkInterfaces"]
+    assert len(nics) == 1
+    assert any("Quarantine" in g["GroupName"] for g in nics[0]["Groups"])
+
+
+def test_quarantine_instance_isolates_every_eni(mock_ec2_client):
+    """An instance with multiple ENIs must have the quarantine SG applied to ALL of them, not just the primary."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    subnet = mock_ec2_client.create_subnet(VpcId=vpc["Vpc"]["VpcId"], CidrBlock="10.0.1.0/24")
+    instance = mock_ec2_client.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        SubnetId=subnet["Subnet"]["SubnetId"],
+    )
+    instance_id = instance["Instances"][0]["InstanceId"]
+
+    second_eni = mock_ec2_client.create_network_interface(SubnetId=subnet["Subnet"]["SubnetId"])["NetworkInterface"]
+    mock_ec2_client.attach_network_interface(NetworkInterfaceId=second_eni["NetworkInterfaceId"], InstanceId=instance_id, DeviceIndex=1)
+
+    result = quarantine_instance(instance_id, vpc["Vpc"]["VpcId"])
+    assert result is True
+
+    instance_desc = mock_ec2_client.describe_instances(InstanceIds=[instance_id])
+    nics = instance_desc["Reservations"][0]["Instances"][0]["NetworkInterfaces"]
+    assert len(nics) == 2
+    for nic in nics:
+        assert any("Quarantine" in g["GroupName"] for g in nic["Groups"]), f"ENI {nic['NetworkInterfaceId']} was not quarantined"
 
 
 def test_snapshot_instance(mock_ec2_client):
@@ -817,6 +858,61 @@ def test_snapshot_instance(mock_ec2_client):
 
     result = snapshot_instance(instance_id)
     assert result is True
+
+
+def test_asg_detach_instance_missing_instance_id_returns_false():
+    """A falsy instance_id must be rejected before making any AWS calls."""
+    assert asg_detach_instance(None) is False
+    assert asg_detach_instance("") is False
+
+
+def test_asg_detach_instance_no_asg_membership_returns_false(aws_credentials):
+    """An instance not in any ASG is a no-op and must not be reported as a successful action."""
+    import boto3
+    from moto import mock_aws
+
+    with mock_aws():
+        ec2 = boto3.client("ec2", region_name="us-east-1")
+        vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+        subnet = ec2.create_subnet(VpcId=vpc["Vpc"]["VpcId"], CidrBlock="10.0.1.0/24")
+        instance = ec2.run_instances(
+            ImageId="ami-12345678",
+            MinCount=1,
+            MaxCount=1,
+            SubnetId=subnet["Subnet"]["SubnetId"],
+        )
+        instance_id = instance["Instances"][0]["InstanceId"]
+
+        assert asg_detach_instance(instance_id) is False
+
+
+def test_asg_detach_instance_detaches_when_in_asg(aws_credentials):
+    """When the instance IS in an ASG, detaching returns True and actually removes it from the ASG."""
+    import boto3
+    from moto import mock_aws
+
+    with mock_aws():
+        ec2 = boto3.client("ec2", region_name="us-east-1")
+        autoscaling = boto3.client("autoscaling", region_name="us-east-1")
+        vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")
+        subnet = ec2.create_subnet(VpcId=vpc["Vpc"]["VpcId"], CidrBlock="10.0.1.0/24")
+
+        autoscaling.create_launch_configuration(LaunchConfigurationName="lc1", ImageId="ami-12345678", InstanceType="t2.micro")
+        autoscaling.create_auto_scaling_group(
+            AutoScalingGroupName="asg1",
+            LaunchConfigurationName="lc1",
+            MinSize=0,
+            MaxSize=2,
+            DesiredCapacity=1,
+            VPCZoneIdentifier=subnet["Subnet"]["SubnetId"],
+        )
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=["asg1"])["AutoScalingGroups"][0]
+        instance_id = group["Instances"][0]["InstanceId"]
+
+        assert asg_detach_instance(instance_id) is True
+
+        remaining = autoscaling.describe_auto_scaling_instances(InstanceIds=[instance_id])["AutoScalingInstances"]
+        assert remaining == []
 
 
 # --- lambda_handler action dispatch tests ---
