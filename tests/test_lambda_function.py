@@ -109,6 +109,10 @@ def test_enhance_message_with_claude(mock_bedrock):
     assert "top_p" not in call_body  # temperature and top_p are mutually exclusive on Claude 4.x
     assert len(call_body["messages"]) == 1
     assert call_body["messages"][0]["role"] == "user"
+    # Prompt is status-aware so the AI recommends follow-up, not actions GDPatrol already took.
+    prompt_text = call_body["messages"][0]["content"]
+    assert "remediated" in prompt_text and "no-playbook" in prompt_text
+    assert "do NOT recommend actions GDPatrol already performed" in prompt_text
 
     field_titles = [f["title"] for f in result["attachments"][0]["fields"]]
     assert "AI Analysis" in field_titles

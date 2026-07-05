@@ -111,10 +111,15 @@ def enhance_message_with_claude(message_data: Dict[str, Any]) -> Dict[str, Any]:
     Enhance the message using Claude Sonnet on AWS Bedrock.
     """
     try:
-        prompt = f"""You are a security expert analyzing a GuardDuty finding. Provide a concise analysis:
+        prompt = f"""You are a security expert triaging a GuardDuty finding that GDPatrol has already processed automatically. The alert data below reports GDPatrol's response in its "Status" and "Auto-remediation" fields:
+- Status "remediated": GDPatrol already executed the listed auto-remediation (e.g. blocked the source IP, quarantined the instance). Acknowledge what was done and recommend ONLY the human follow-up still needed — do NOT recommend actions GDPatrol already performed.
+- Status "needs-review": a playbook exists but GDPatrol did not fully act (below its action threshold, or a protected account). Note why, and advise whether a human should act manually.
+- Status "no-playbook": nothing was auto-remediated — recommend the full investigation and remediation.
+
+Provide a concise analysis:
 1. What this alert means in plain language
 2. Potential impact and severity
-3. Recommended investigation and remediation steps
+3. Recommended next steps, following the guidance above (never repeat actions already completed)
 
 Alert data:
 {json.dumps(message_data, indent=2)}
@@ -984,6 +989,26 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     else:
         remediation_status = "needs-review"
     fields.append({"title": "Status", "value": remediation_status, "short": "true"})
+
+    # Concrete auto-remediation detail, so the human sees exactly what ran and the AI
+    # analysis recommends follow-up instead of repeating actions GDPatrol already took.
+    target = (
+        event_summary.get("source_ip")
+        or event_summary.get("domain")
+        or event_summary.get("instance_id")
+        or event_summary.get("username")
+        or "N/A"
+    )
+    actions_str = ", ".join(config_actions) if config_actions else "none"
+    if remediation_status == "remediated":
+        auto_remediation = f"{actions_str} → {target} (completed automatically)"
+    elif remediation_status == "needs-review":
+        auto_remediation = (
+            f"{actions_str} → {target}; only {successful_actions}/{actions_to_be_executed} ran (below action threshold or protected target)"
+        )
+    else:
+        auto_remediation = "none — no playbook configured for this finding type"
+    fields.append({"title": "Auto-remediation", "value": auto_remediation})
 
     # Timestamp for the footer, computed per invocation
     st = datetime.datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
