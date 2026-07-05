@@ -63,6 +63,18 @@ def test_config_unknown_finding_type():
         assert config.get_reliability() == 5
 
 
+def test_real_config_actions_are_all_lists():
+    """Every playbook entry in the real config.json must use list-form actions.
+
+    Regression test for config.json's Persistence:IAMUser/NetworkPermissions entry,
+    which held actions as a bare string ("disable_sg_access") instead of a list.
+    """
+    real_config_path = Path(__file__).parent.parent / "GDPatrol" / "config.json"
+    data = json.loads(real_config_path.read_text())
+    for playbook in data["playbooks"]["playbook"]:
+        assert isinstance(playbook["actions"], list), f"{playbook['type']} actions is not a list"
+
+
 @patch("GDPatrol.lambda_function.bedrock_client")
 def test_enhance_message_with_claude(mock_bedrock):
     """Test that enhance_message_with_claude calls Bedrock and appends AI Analysis."""

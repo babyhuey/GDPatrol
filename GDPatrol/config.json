@@ -65,7 +65,7 @@
       },
       {
         "type": "Persistence:IAMUser/NetworkPermissions",
-        "actions": "disable_sg_access",
+        "actions": ["disable_sg_access"],
         "reliability": 5
       },
       {
