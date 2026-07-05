@@ -1,5 +1,6 @@
 import pytest
 import json
+import logging
 import time
 import socket
 from unittest.mock import patch, MagicMock
@@ -62,6 +63,20 @@ def test_config_unknown_finding_type():
         config = Config("InvalidFindingType")
         assert config.get_actions() == []
         assert config.get_reliability() == 5
+
+
+def test_get_reliability_fallback_logs_warning(caplog):
+    """Falling back to the default reliability of 5 for an unknown finding type must log a
+    warning, so a typo'd finding type in config.json is visible instead of silently under-gating."""
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with patch("builtins.open", MagicMock()) as mock_open:
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        config = Config("TotallyUnknownFindingType")
+        with caplog.at_level(logging.WARNING):
+            reliability = config.get_reliability()
+
+    assert reliability == 5
+    assert any("TotallyUnknownFindingType" in record.message for record in caplog.records)
 
 
 def test_real_config_actions_are_all_lists():
@@ -332,12 +347,13 @@ def test_lambda_handler_rds_finding(
         patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
     ):
         mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
-        # RDS finding with severity 5 + reliability 5 = 10, won't execute
+        # RDS finding with severity 4 + reliability 5 = 9, below the gate, won't execute
+        sample_rds_guardduty_event["severity"] = 4
         lambda_handler(sample_rds_guardduty_event, None)
         mock_blacklist.assert_not_called()
 
-        # Bump severity so it triggers (severity 8 + reliability 5 = 13 > 10)
-        sample_rds_guardduty_event["severity"] = 8
+        # Exactly at the boundary (severity 5 + reliability 5 = 10) now triggers under the >= gate
+        sample_rds_guardduty_event["severity"] = 5
         lambda_handler(sample_rds_guardduty_event, None)
         mock_blacklist.assert_called_once_with("203.0.113.50")
 
@@ -859,6 +875,27 @@ def test_disable_account(mock_ec2_client, aws_credentials):
         assert "BlockAllPolicy" in policies["PolicyNames"]
 
 
+def test_disable_account_skips_protected_user(aws_credentials):
+    """A protected user must never be auto-disabled — no policy attached, returns False."""
+    import boto3
+    from moto import mock_aws
+
+    with mock_aws(), patch("GDPatrol.lambda_function.PROTECTED_USERS", {"protecteduser", "root"}):
+        iam = boto3.client("iam", region_name="us-east-1")
+        iam.create_user(UserName="protecteduser")
+        assert disable_account("protecteduser") is False
+        assert disable_ec2_access("protecteduser") is False
+        assert disable_sg_access("protecteduser") is False
+        assert iam.list_user_policies(UserName="protecteduser")["PolicyNames"] == []
+
+
+def test_root_is_always_protected():
+    """root must be protected even when GD_PATROL_PROTECTED_USERS is unset."""
+    from GDPatrol.lambda_function import PROTECTED_USERS
+
+    assert "root" in PROTECTED_USERS
+
+
 def test_disable_ec2_access(aws_credentials):
     """Test disabling EC2 access for a user."""
     import boto3
@@ -1085,8 +1122,351 @@ def test_lambda_handler_blacklist_ip_count_threshold(monkeypatch):
         mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
         mock_blacklist.return_value = True
         lambda_handler(event, None)
-        # severity 2 + reliability 5 = 7, not > 10, but count 200 > 100
+        # severity 2 + reliability 5 = 7, not >= 10, but count 200 > 100
         mock_blacklist.assert_called_once_with("1.2.3.4")
+
+
+def test_lambda_handler_blacklist_domain_count_threshold(monkeypatch):
+    """blacklist_domain must also bypass the reliability gate when count > 100, matching blacklist_ip."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-domain-id",
+        "type": "SomeDomainFinding",
+        "severity": 2,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "service": {
+            "action": {
+                "actionType": "DNS_REQUEST",
+                "dnsRequestAction": {"domain": "malicious.example.com"},
+            },
+            "count": 200,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "DNS beacon",
+    }
+    config_data = {"playbooks": {"playbook": [{"type": "SomeDomainFinding", "actions": ["blacklist_domain"], "reliability": 5}]}}
+
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.resolve_domain_a_records", return_value=["1.2.3.4"]),
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        mock_blacklist.return_value = True
+        lambda_handler(event, None)
+        # severity 2 + reliability 5 = 7, not >= 10, but count 200 > 100
+        mock_blacklist.assert_called_once_with("1.2.3.4")
+
+
+def test_lambda_handler_disable_account_blocked_below_severity_floor(monkeypatch):
+    """disable_account's strict gate requires severity >= 7 regardless of how high the combined
+    score is — a sev-6 finding must not disable an account even with reliability 10 (sum 16)."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "SomeIAMFinding",
+        "severity": 6,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "AccessKey",
+            "accessKeyDetails": {"userName": "baduser"},
+        },
+        "service": {
+            "action": {"actionType": "AWS_API_CALL", "awsApiCallAction": {}},
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "IAM finding",
+    }
+    config_data = {"playbooks": {"playbook": [{"type": "SomeIAMFinding", "actions": ["disable_account"], "reliability": 10}]}}
+
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.disable_account") as mock_disable,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+        mock_disable.assert_not_called()
+
+
+def test_lambda_handler_disable_account_fires_when_sum_exceeds_threshold(monkeypatch):
+    """disable_account must fire once severity >= 7 AND severity + reliability > 13."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "SomeIAMFinding",
+        "severity": 7,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "AccessKey",
+            "accessKeyDetails": {"userName": "baduser"},
+        },
+        "service": {
+            "action": {"actionType": "AWS_API_CALL", "awsApiCallAction": {}},
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "IAM finding",
+    }
+    # severity 7 + reliability 7 = 14, > 13
+    config_data = {"playbooks": {"playbook": [{"type": "SomeIAMFinding", "actions": ["disable_account"], "reliability": 7}]}}
+
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.disable_account") as mock_disable,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        mock_disable.return_value = True
+        lambda_handler(event, None)
+        mock_disable.assert_called_once_with("baduser")
+
+
+def test_lambda_handler_disable_account_strict_boundary_is_exclusive(monkeypatch):
+    """The disable_account combined-score gate is strict (>), not >=: severity + reliability == 13
+    must NOT fire, while == 14 must. Guards against an accidental future switch to >=."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    def make_event(severity):
+        return {
+            "id": "test-id",
+            "type": "SomeIAMFinding",
+            "severity": severity,
+            "accountId": "123456789012",
+            "region": "us-east-1",
+            "resource": {"resourceType": "AccessKey", "accessKeyDetails": {"userName": "baduser"}},
+            "service": {
+                "action": {"actionType": "AWS_API_CALL", "awsApiCallAction": {}},
+                "count": 1,
+                "eventFirstSeen": "2024-01-01T00:00:00Z",
+                "eventLastSeen": "2024-01-01T00:00:00Z",
+            },
+            "description": "IAM finding",
+        }
+
+    # reliability 6: at severity 7.0 the sum is exactly 13 (severity floor met, but 13 is not > 13).
+    config_data = {"playbooks": {"playbook": [{"type": "SomeIAMFinding", "actions": ["disable_account"], "reliability": 6}]}}
+
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.disable_account") as mock_disable,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        mock_disable.return_value = True
+
+        # severity 7.0 + reliability 6 == 13, NOT > 13 -> must not fire
+        lambda_handler(make_event(7.0), None)
+        mock_disable.assert_not_called()
+
+        # severity 8.0 + reliability 6 == 14 > 13 -> must fire
+        lambda_handler(make_event(8.0), None)
+        mock_disable.assert_called_once_with("baduser")
+
+
+def test_lambda_handler_raised_iam_entry_fires_at_high_severity(monkeypatch):
+    """A raised high-confidence IAM entry (InstanceCredentialExfiltration, reliability 8) must
+    auto-disable at a genuine High severity of 7.0 (7 >= 7 and 7 + 8 = 15 > 13)."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration",
+        "severity": 7.0,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {"resourceType": "AccessKey", "accessKeyDetails": {"userName": "baduser"}},
+        "service": {
+            "action": {"actionType": "AWS_API_CALL", "awsApiCallAction": {}},
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "Credential exfiltration",
+    }
+
+    # Use the REAL config.json so the raised reliability (8) for this type is what's exercised.
+    real_config_path = Path(__file__).parent.parent / "GDPatrol" / "config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.disable_account") as mock_disable,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = real_config_path.read_text()
+        mock_disable.return_value = True
+        lambda_handler(event, None)
+        mock_disable.assert_called_once_with("baduser")
+
+
+def test_lambda_handler_strict_gate_isolated_to_disable_account(monkeypatch):
+    """The strict severity>=7 gate is scoped to disable_account only: a severity-6 finding whose
+    playbook has both disable_account and blacklist_ip must NOT disable the account (6 < 7) but
+    must still run blacklist_ip (6 + reliability 8 = 14 >= 10)."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "UnauthorizedAccess:IAMUser/MaliciousIPCaller",
+        "severity": 6,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {"resourceType": "AccessKey", "accessKeyDetails": {"userName": "baduser"}},
+        "service": {
+            "action": {
+                "actionType": "AWS_API_CALL",
+                "awsApiCallAction": {"remoteIpDetails": {"ipAddressV4": "9.8.7.6"}},
+            },
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "IAM malicious caller",
+    }
+
+    # Real config: this type has actions [disable_account, blacklist_ip] at reliability 8.
+    real_config_path = Path(__file__).parent.parent / "GDPatrol" / "config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.disable_account") as mock_disable,
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = real_config_path.read_text()
+        mock_blacklist.return_value = True
+        lambda_handler(event, None)
+        mock_disable.assert_not_called()
+        mock_blacklist.assert_called_once_with("9.8.7.6")
+
+
+def test_lambda_handler_notifies_when_configured_action_does_not_execute(monkeypatch):
+    """A finding must still notify when its configured playbook didn't fully execute, even if
+    severity alone wouldn't cross the notify threshold — the Status field must read 'needs-review'."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "severity": 3,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "RDSDBInstance",
+            "rdsDbInstanceDetails": {"dbInstanceIdentifier": "testdb", "engine": "mysql"},
+        },
+        "service": {
+            "action": {
+                "actionType": "RDS_LOGIN_ATTEMPT",
+                "rdsLoginAttemptAction": {"remoteIpDetails": {"ipAddressV4": "1.2.3.4"}},
+            },
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "RDS finding",
+    }
+
+    # test_config.json reliability for this type is 5; severity 3 + 5 = 8, below the >=10 gate,
+    # so the one configured action never fires — it must still notify, as "needs-review".
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        lambda_handler(event, None)
+
+        mock_blacklist.assert_not_called()
+        mock_publish.assert_called_once()
+        published = json.loads(mock_publish.call_args[0][1])
+        fields = published["attachments"][0]["fields"]
+        status_field = next(f for f in fields if f["title"] == "Status")
+        assert status_field["value"] == "needs-review"
+
+
+def test_lambda_handler_status_field_remediated_when_all_actions_succeed(monkeypatch):
+    """When every configured action executes and succeeds, the Status field reads 'remediated'."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "Discovery:RDS/MaliciousIPCaller",
+        "severity": 8,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "RDSDBInstance",
+            "rdsDbInstanceDetails": {"dbInstanceIdentifier": "testdb", "engine": "mysql"},
+        },
+        "service": {
+            "action": {
+                "actionType": "RDS_LOGIN_ATTEMPT",
+                "rdsLoginAttemptAction": {"remoteIpDetails": {"ipAddressV4": "1.2.3.4"}},
+            },
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "RDS finding",
+    }
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=True),
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        lambda_handler(event, None)
+
+        published = json.loads(mock_publish.call_args[0][1])
+        fields = published["attachments"][0]["fields"]
+        status_field = next(f for f in fields if f["title"] == "Status")
+        assert status_field["value"] == "remediated"
+
+
+def test_lambda_handler_status_field_no_playbook_when_no_actions_configured(monkeypatch):
+    """A finding type with no configured playbook actions must report 'no-playbook'."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-id",
+        "type": "NoPlaybookConfigured",
+        "severity": 6,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "service": {
+            "action": {},
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "Unhandled finding type",
+    }
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = test_config_path.read_text()
+        lambda_handler(event, None)
+
+        published = json.loads(mock_publish.call_args[0][1])
+        fields = published["attachments"][0]["fields"]
+        status_field = next(f for f in fields if f["title"] == "Status")
+        assert status_field["value"] == "no-playbook"
 
 
 def test_lambda_handler_iam_finding(monkeypatch):
@@ -1123,13 +1503,14 @@ def test_lambda_handler_iam_finding(monkeypatch):
         patch("GDPatrol.lambda_function.publish_message"),
         patch("GDPatrol.lambda_function.disable_account") as mock_disable,
     ):
-        # Add the IAM finding type to the mock config
+        # Add the IAM finding type to the mock config. disable_account's strict gate needs
+        # severity >= 7 (met: 8) AND severity + reliability > 13, so reliability 6 (sum 14) is used.
         config_data = json.loads(test_config_path.read_text())
         config_data["playbooks"]["playbook"].append(
             {
                 "type": "Recon:IAMUser/MaliciousIPCaller",
                 "actions": ["disable_account"],
-                "reliability": 5,
+                "reliability": 6,
             }
         )
         mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)

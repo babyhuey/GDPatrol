@@ -90,6 +90,14 @@ def run(slack_web_hook_url=None):
     # Pass the Slack webhook through to the function; without it the Lambda
     # logs "Error publishing message to Slack" and no notification is sent
     lambda_env = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
+    # IAM users exempt from auto-disable, supplied at deploy time via the
+    # GD_PATROL_PROTECTED_USERS environment variable (comma-separated) so real
+    # usernames are never committed. root is always protected in code.
+    protected_users = environ.get("GD_PATROL_PROTECTED_USERS", "")
+    if protected_users:
+        lambda_env["GD_PATROL_PROTECTED_USERS"] = protected_users
+    else:
+        print("NOTE: GD_PATROL_PROTECTED_USERS not set; only root is protected from auto-disable.")
     slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
     if slack_web_hook_url:
         lambda_env["SLACK_WEB_HOOK_URL"] = slack_web_hook_url

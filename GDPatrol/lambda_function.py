@@ -23,6 +23,10 @@ GD_PATROL_LOCK_TABLE = os.environ.get("GD_PATROL_LOCK_TABLE", "GDPatrol_lock")
 # each mutate every NACL in the account rather than just one keyed by IP.
 GD_PATROL_NACL_LOCK_ID = "gdpatrol-nacl"
 
+# IAM users that must never be auto-disabled by disable_account / disable_ec2_access /
+# disable_sg_access. Comma-separated in GD_PATROL_PROTECTED_USERS; root is always protected.
+PROTECTED_USERS = {u.strip().lower() for u in os.environ.get("GD_PATROL_PROTECTED_USERS", "").split(",") if u.strip()} | {"root"}
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -628,7 +632,15 @@ def snapshot_instance(instance_id):
         return False
 
 
+def _is_protected_user(username) -> bool:
+    """True if the IAM user is on the protected list and must not be auto-disabled."""
+    return bool(username) and username.lower() in PROTECTED_USERS
+
+
 def disable_account(username):
+    if _is_protected_user(username):
+        logger.warning(f"GDPatrol: {username} is a protected user; skipping {stack()[0][3]}")
+        return False
     try:
         client = boto3.client("iam")
         client.put_user_policy(
@@ -644,6 +656,9 @@ def disable_account(username):
 
 
 def disable_ec2_access(username):
+    if _is_protected_user(username):
+        logger.warning(f"GDPatrol: {username} is a protected user; skipping {stack()[0][3]}")
+        return False
     try:
         client = boto3.client("iam")
         client.put_user_policy(
@@ -673,6 +688,9 @@ def enable_ec2_access(username):
 
 
 def disable_sg_access(username):
+    if _is_protected_user(username):
+        logger.warning(f"GDPatrol: {username} is a protected user; skipping {stack()[0][3]}")
+        return False
     try:
         client = boto3.client("iam")
         client.put_user_policy(
@@ -766,6 +784,7 @@ class Config:
         for playbook in self.config["playbooks"]["playbook"]:
             if playbook["type"] == self.finding_type:
                 return playbook["reliability"]
+        logger.warning(f"GDPatrol: No config entry for finding type '{self.finding_type}'; defaulting reliability to 5")
         return 5
 
 
@@ -820,7 +839,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     for action in config_actions:
         logger.info(f"GDPatrol: Action: {action}")
         if action == "blacklist_ip":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = blacklist_ip(ip_address)
@@ -831,13 +850,21 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
                 result = blacklist_ip(ip_address)
                 successful_actions += int(result)
         elif action == "whitelist_ip":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = whitelist_ip(ip_address)
                 successful_actions += int(result)
         elif action == "blacklist_domain":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
+                actions_to_be_executed += 1
+                logger.info(f"GDPatrol: Executing action {action}")
+                domain_blocked = False
+                for resolved_ip in resolve_domain_a_records(domain):
+                    if blacklist_ip(resolved_ip):
+                        domain_blocked = True
+                successful_actions += int(domain_blocked)
+            elif count > 100:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 domain_blocked = False
@@ -846,49 +873,51 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
                         domain_blocked = True
                 successful_actions += int(domain_blocked)
         elif action == "quarantine_instance":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = quarantine_instance(instance_id, vpc_id)
                 successful_actions += int(result)
         elif action == "snapshot_instance":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = snapshot_instance(instance_id)
                 successful_actions += int(result)
         elif action == "disable_account":
-            if severity + config_reliability > 10:
+            # Stricter, standalone gate: no automated rollback exists for disable_account,
+            # so it requires both a high absolute severity and a high combined score.
+            if severity >= 7 and (severity + config_reliability) > 13:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = disable_account(username)
                 successful_actions += int(result)
         elif action == "disable_ec2_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = disable_ec2_access(username)
                 successful_actions += int(result)
         elif action == "enable_ec2_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = enable_ec2_access(username)
                 successful_actions += int(result)
         elif action == "disable_sg_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = disable_sg_access(username)
                 successful_actions += int(result)
         elif action == "enable_sg_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = enable_sg_access(username)
                 successful_actions += int(result)
         elif action == "asg_detach_instance":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = asg_detach_instance(instance_id)
@@ -941,6 +970,15 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         }
     )
 
+    # Status line: whether the configured playbook (if any) fully remediated the finding.
+    if total_config_actions == 0:
+        remediation_status = "no-playbook"
+    elif successful_actions == total_config_actions:
+        remediation_status = "remediated"
+    else:
+        remediation_status = "needs-review"
+    fields.append({"title": "Status", "value": remediation_status, "short": "true"})
+
     # Timestamp for the footer, computed per invocation
     st = datetime.datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
     guardduty_finding = {
@@ -954,7 +992,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             }
         ]
     }
-    if severity > 5:
+    # Notify on high severity, OR when a configured playbook didn't fully execute — decoupled
+    # from pure severity so a partially-remediated finding is never silently dropped.
+    if severity >= 5 or (total_config_actions > 0 and successful_actions < total_config_actions):
         publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
