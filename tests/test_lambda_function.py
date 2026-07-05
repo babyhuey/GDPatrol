@@ -208,6 +208,30 @@ def test_blacklist_ip_blocks_all_nacls(mock_ec2_client, mock_dynamodb_client):
         )
 
 
+def test_aggressive_cleanup_scales_with_configured_limit(mock_ec2_client, mock_dynamodb_client):
+    """The cleanup trigger (limit-1) and keep-count (limit//2) follow NACL_RULE_LIMIT."""
+    vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")
+    nacl_id = mock_ec2_client.create_network_acl(VpcId=vpc["Vpc"]["VpcId"])["NetworkAcl"]["NetworkAclId"]
+    create_gdpatrol_table(mock_dynamodb_client)
+    create_lock_table(mock_dynamodb_client)
+    # Seed 5 GDPatrol /32 deny rules. With NACL_RULE_LIMIT=6 the trigger is >=5, so
+    # blocking one more fires aggressive cleanup (keep 6//2=3, evict the rest).
+    for i, rn in enumerate(range(100, 95, -1)):
+        mock_ec2_client.create_network_acl_entry(
+            CidrBlock=f"10.0.0.{i}/32", Egress=False, NetworkAclId=nacl_id, Protocol="-1", RuleAction="deny", RuleNumber=rn
+        )
+    with patch("GDPatrol.lambda_function.NACL_RULE_LIMIT", 6):
+        assert blacklist_ip("203.0.113.50") is True
+    deny = [
+        e
+        for e in mock_ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]["Entries"]
+        if not e["Egress"] and e["RuleAction"] == "deny" and e.get("CidrBlock", "").endswith("/32")
+    ]
+    # Without cleanup it would be 6 (5 old + new); cleanup kept 3 old + added the new = 4.
+    assert len(deny) <= 4, f"cleanup did not cap to the configured limit: {len(deny)} rules"
+    assert any(e["CidrBlock"] == "203.0.113.50/32" for e in deny)
+
+
 @patch("GDPatrol.lambda_function.release_lock")
 @patch("GDPatrol.lambda_function.acquire_lock")
 def test_blacklist_ip_no_release_when_acquire_fails(mock_acquire, mock_release):

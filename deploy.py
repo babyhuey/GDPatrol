@@ -98,6 +98,11 @@ def run(slack_web_hook_url=None):
         lambda_env["GD_PATROL_PROTECTED_USERS"] = protected_users
     else:
         print("NOTE: GD_PATROL_PROTECTED_USERS not set; only root is protected from auto-disable.")
+    # Match the account's actual "Rules per network ACL" quota (default 20, raisable to 40)
+    # so GDPatrol uses the available headroom instead of self-capping at 20.
+    nacl_rule_limit = environ.get("GD_PATROL_NACL_RULE_LIMIT")
+    if nacl_rule_limit:
+        lambda_env["GD_PATROL_NACL_RULE_LIMIT"] = nacl_rule_limit
     slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
     if slack_web_hook_url:
         lambda_env["SLACK_WEB_HOOK_URL"] = slack_web_hook_url

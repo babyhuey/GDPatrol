@@ -27,6 +27,12 @@ GD_PATROL_NACL_LOCK_ID = "gdpatrol-nacl"
 # disable_sg_access. Comma-separated in GD_PATROL_PROTECTED_USERS; root is always protected.
 PROTECTED_USERS = {u.strip().lower() for u in os.environ.get("GD_PATROL_PROTECTED_USERS", "").split(",") if u.strip()} | {"root"}
 
+# Max ingress deny rules GDPatrol maintains per NACL. AWS default is 20 rules/direction,
+# raisable to 40 via the "Rules per network ACL" (L-2AEEBF1A) Service Quota. Set
+# GD_PATROL_NACL_RULE_LIMIT to match the account's actual quota so GDPatrol uses the
+# available headroom instead of self-capping at 20.
+NACL_RULE_LIMIT = int(os.environ.get("GD_PATROL_NACL_RULE_LIMIT", "20"))
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -417,8 +423,8 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                 if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
             ]
 
-            # Check if we're approaching the limit (max 20 rules per direction)
-            if len(deny_rules) >= 19:
+            # Check if we're approaching the per-direction rule limit
+            if len(deny_rules) >= NACL_RULE_LIMIT - 1:
                 logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, performing aggressive cleanup.")
                 # Rule numbers no longer indicate age once the allocator falls back to the high end,
                 # so order by the DynamoDB created_at tracking data instead. Rules with no tracking
@@ -436,10 +442,10 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                         created_at_by_rule_number[int(item["rule_number"]["S"])] = item["created_at"]["S"]
                 except Exception as e:
                     logger.error(f"Error querying DynamoDB for NACL {nacl['NetworkAclId']} during cleanup: {e}")
-                # Newest first, so the 10 most recent are kept and the remainder (oldest) are deleted.
+                # Newest first, so the most recent half is kept and the remainder (oldest) deleted.
                 deny_rules_sorted = sorted(deny_rules, key=lambda r: created_at_by_rule_number.get(r["RuleNumber"], ""), reverse=True)
-                # Keep only the 10 most recent rules
-                rules_to_delete = deny_rules_sorted[10:]
+                # Keep the most recent half of the limit; evict the rest to make headroom.
+                rules_to_delete = deny_rules_sorted[max(1, NACL_RULE_LIMIT // 2) :]
                 deleted_rule_numbers = set()
                 for rule in rules_to_delete:
                     try:
