@@ -6,8 +6,6 @@
       "Action": [
         "ec2:RevokeSecurityGroupEgress",
         "ec2:CreateSnapshot",
-        "iam:PutUserPolicy",
-        "iam:DeleteUserPolicy",
         "ec2:DeleteNetworkAclEntry",
         "autoscaling:DetachInstances"
       ],
@@ -16,9 +14,21 @@
         "arn:aws:ec2:*:*:volume/*",
         "arn:aws:ec2:*:*:security-group/*",
         "arn:aws:ec2:*:*:network-acl/*",
-        "arn:aws:iam::*:user/*",
         "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/*"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:PutUserPolicy",
+        "iam:DeleteUserPolicy"
+      ],
+      "Resource": "arn:aws:iam::*:user/*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PolicyName": ["BlockAllPolicy", "BlockEC2Policy", "BlockSecurityGroupPolicy"]
+        }
+      }
     },
     {
       "Effect": "Allow",
@@ -47,7 +57,10 @@
     {
       "Effect": "Allow",
       "Action": [
-        "dynamodb:*"
+        "dynamodb:Query",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:DeleteItem"
       ],
       "Resource": [
         "arn:aws:dynamodb:*:*:table/GDPatrol",
