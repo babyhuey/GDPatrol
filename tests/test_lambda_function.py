@@ -1015,6 +1015,42 @@ def test_slack_fields_no_playbook(monkeypatch):
     assert "no playbook" in _published_field(mock_publish, "Auto-remediation")
 
 
+def test_no_slack_alert_for_low_severity_skipped_playbook(monkeypatch):
+    """A low-severity finding whose playbook is skipped by the execution gate does not
+    alert — the skip is by design (e.g. Recon:EC2/PortProbeUnprotectedPort at severity 2),
+    not a remediation failure."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+    # severity 2 + reliability 5 = 7, below the >= 10 gate: blacklist_ip is skipped
+    event = _rds_ip_event("TestIPFinding", 2)
+    config_data = {"playbooks": {"playbook": [{"type": "TestIPFinding", "actions": ["blacklist_ip"], "reliability": 5}]}}
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+        mock_blacklist.assert_not_called()
+    mock_publish.assert_not_called()
+
+
+def test_slack_alert_when_attempted_action_fails(monkeypatch):
+    """An action that was attempted but failed still alerts even below severity 5."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+    # severity 4 + reliability 8 = 12, above the gate: blacklist_ip is attempted and fails
+    event = _rds_ip_event("TestIPFinding", 4)
+    config_data = {"playbooks": {"playbook": [{"type": "TestIPFinding", "actions": ["blacklist_ip"], "reliability": 8}]}}
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=False),
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+    mock_publish.assert_called_once()
+    assert _published_field(mock_publish, "Status") == "needs-review"
+
+
 def test_disable_ec2_access(aws_credentials):
     """Test disabling EC2 access for a user."""
     import boto3
@@ -1468,9 +1504,9 @@ def test_lambda_handler_strict_gate_isolated_to_disable_account(monkeypatch):
         mock_blacklist.assert_called_once_with("9.8.7.6")
 
 
-def test_lambda_handler_notifies_when_configured_action_does_not_execute(monkeypatch):
-    """A finding must still notify when its configured playbook didn't fully execute, even if
-    severity alone wouldn't cross the notify threshold — the Status field must read 'needs-review'."""
+def test_lambda_handler_no_notify_when_action_skipped_by_gate(monkeypatch):
+    """A low-severity finding whose configured playbook is skipped by the execution gate
+    must NOT notify — the skip is intentional, so there is nothing for a human to review."""
     monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
 
     event = {
@@ -1496,7 +1532,7 @@ def test_lambda_handler_notifies_when_configured_action_does_not_execute(monkeyp
     }
 
     # test_config.json reliability for this type is 5; severity 3 + 5 = 8, below the >=10 gate,
-    # so the one configured action never fires — it must still notify, as "needs-review".
+    # so the one configured action never fires — and no Slack message goes out.
     test_config_path = Path(__file__).parent / "test_config.json"
     with (
         patch("builtins.open", MagicMock()) as mock_open,
@@ -1507,11 +1543,7 @@ def test_lambda_handler_notifies_when_configured_action_does_not_execute(monkeyp
         lambda_handler(event, None)
 
         mock_blacklist.assert_not_called()
-        mock_publish.assert_called_once()
-        published = json.loads(mock_publish.call_args[0][1])
-        fields = published["attachments"][0]["fields"]
-        status_field = next(f for f in fields if f["title"] == "Status")
-        assert status_field["value"] == "needs-review"
+        mock_publish.assert_not_called()
 
 
 def test_lambda_handler_status_field_remediated_when_all_actions_succeed(monkeypatch):
