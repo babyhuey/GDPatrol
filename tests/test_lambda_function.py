@@ -1034,6 +1034,20 @@ def test_no_slack_alert_for_low_severity_skipped_playbook(monkeypatch):
     mock_publish.assert_not_called()
 
 
+def test_no_slack_alert_at_severity_five(monkeypatch):
+    """Severity 5 exactly is below the strictly-greater-than notify threshold."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+    event = _rds_ip_event("UnconfiguredFinding", 5)
+    config_data = {"playbooks": {"playbook": []}}
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)
+    mock_publish.assert_not_called()
+
+
 def test_slack_alert_when_attempted_action_fails(monkeypatch):
     """An action that was attempted but failed still alerts even below severity 5."""
     monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")

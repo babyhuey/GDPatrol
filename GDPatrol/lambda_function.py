@@ -1026,7 +1026,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     # Notify on high severity, OR when an attempted action failed — decoupled from pure
     # severity so a partially-remediated finding is never silently dropped. Actions skipped
     # because they fell below the execution gate are by design and don't warrant an alert.
-    if severity >= 5 or successful_actions < actions_to_be_executed:
+    if severity > 5 or successful_actions < actions_to_be_executed:
         publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
