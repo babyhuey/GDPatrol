@@ -147,6 +147,32 @@ def test_publish_message(mock_post, mock_enhance):
     mock_post.assert_called_once()
 
 
+def test_get_slack_webhook_prefers_env(monkeypatch):
+    """The env var fallback wins when set (local runs, pre-SSM deployments)."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/env")
+    assert lambda_module.get_slack_web_hook_url() == "https://hooks.slack.com/services/env"
+
+
+def test_get_slack_webhook_reads_ssm_and_caches(monkeypatch):
+    """Without the env var, the webhook is read from SSM once and cached."""
+    monkeypatch.delenv("SLACK_WEB_HOOK_URL", raising=False)
+    monkeypatch.setattr(lambda_module, "_slack_web_hook_url", None)
+    mock_ssm = MagicMock()
+    mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "https://hooks.slack.com/services/ssm"}}
+    with patch("GDPatrol.lambda_function.boto3.client", return_value=mock_ssm):
+        assert lambda_module.get_slack_web_hook_url() == "https://hooks.slack.com/services/ssm"
+        assert lambda_module.get_slack_web_hook_url() == "https://hooks.slack.com/services/ssm"
+    mock_ssm.get_parameter.assert_called_once_with(Name="/gdpatrol/slack_webhook_url", WithDecryption=True)
+
+
+def test_get_slack_webhook_ssm_failure_returns_none(monkeypatch):
+    """An SSM failure logs and returns None instead of raising mid-notification."""
+    monkeypatch.delenv("SLACK_WEB_HOOK_URL", raising=False)
+    monkeypatch.setattr(lambda_module, "_slack_web_hook_url", None)
+    with patch("GDPatrol.lambda_function.boto3.client", side_effect=Exception("no ssm")):
+        assert lambda_module.get_slack_web_hook_url() is None
+
+
 def test_create_network_acl_entry(mock_ec2_client):
     """Test network ACL entry creation."""
     vpc = mock_ec2_client.create_vpc(CidrBlock="10.0.0.0/16")

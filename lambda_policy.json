@@ -70,6 +70,15 @@
     {
       "Effect": "Allow",
       "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/gdpatrol/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
         "bedrock:InvokeModel"
       ],
       "Resource": [

@@ -9,6 +9,7 @@ import boto3
 
 LAMBDA_RUNTIME = "python3.14"
 LAMBDA_REQUIREMENTS = ["requests>=2.32.0"]
+SLACK_WEBHOOK_PARAM = "/gdpatrol/slack_webhook_url"
 
 
 def build_function_zip() -> str:
@@ -87,8 +88,6 @@ def run(slack_web_hook_url=None):
         PolicyDocument=lambda_policy,
     )
 
-    # Pass the Slack webhook through to the function; without it the Lambda
-    # logs "Error publishing message to Slack" and no notification is sent
     lambda_env = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
     # IAM users exempt from auto-disable, supplied at deploy time via the
     # GD_PATROL_PROTECTED_USERS environment variable (comma-separated) so real
@@ -103,10 +102,10 @@ def run(slack_web_hook_url=None):
     nacl_rule_limit = environ.get("GD_PATROL_NACL_RULE_LIMIT")
     if nacl_rule_limit:
         lambda_env["GD_PATROL_NACL_RULE_LIMIT"] = nacl_rule_limit
+    # The Slack webhook is stored per region as a SecureString SSM parameter instead of a
+    # Lambda environment variable, so it never appears in the function configuration.
     slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
-    if slack_web_hook_url:
-        lambda_env["SLACK_WEB_HOOK_URL"] = slack_web_hook_url
-    else:
+    if not slack_web_hook_url:
         print("WARNING: SLACK_WEB_HOOK_URL is not set; Slack notifications will fail.")
 
     deployed_regions = []
@@ -119,6 +118,14 @@ def run(slack_web_hook_url=None):
             lmb = boto3.client("lambda", region_name=region)
             cw_events = boto3.client("events", region_name=region)
             gd = boto3.client("guardduty", region_name=region)
+            if slack_web_hook_url:
+                ssm = boto3.client("ssm", region_name=region)
+                ssm.put_parameter(
+                    Name=SLACK_WEBHOOK_PARAM,
+                    Value=slack_web_hook_url,
+                    Type="SecureString",
+                    Overwrite=True,
+                )
             detector_ids = gd.list_detectors()["DetectorIds"]
             if not detector_ids:
                 created_detector = gd.create_detector(Enable=True)

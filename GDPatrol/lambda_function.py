@@ -13,8 +13,26 @@ import ipaddress
 import boto3
 from botocore.exceptions import ClientError
 
-# Use uppercase for environment variable
-slack_web_hook_url = os.environ.get("SLACK_WEB_HOOK_URL")
+# The Slack webhook lives in a SecureString SSM parameter (written per region by
+# deploy.py) so it never appears in the Lambda's environment configuration. The
+# SLACK_WEB_HOOK_URL env var remains as a fallback for local runs and pre-SSM deploys.
+SLACK_WEBHOOK_PARAM = "/gdpatrol/slack_webhook_url"
+_slack_web_hook_url = None
+
+
+def get_slack_web_hook_url():
+    global _slack_web_hook_url
+    env_url = os.environ.get("SLACK_WEB_HOOK_URL")
+    if env_url:
+        return env_url
+    if _slack_web_hook_url is None:
+        try:
+            ssm_client = boto3.client("ssm")
+            _slack_web_hook_url = ssm_client.get_parameter(Name=SLACK_WEBHOOK_PARAM, WithDecryption=True)["Parameter"]["Value"]
+        except Exception as e:
+            logger.error(f"GDPatrol: Could not read Slack webhook from SSM parameter {SLACK_WEBHOOK_PARAM}: {e}")
+            return None
+    return _slack_web_hook_url
 
 # Use environment variables for table names
 GD_PATROL_TABLE = os.environ.get("GD_PATROL_TABLE", "GDPatrol")
@@ -1031,7 +1049,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     # severity so a partially-remediated finding is never silently dropped. Actions skipped
     # because they fell below the execution gate are by design and don't warrant an alert.
     if severity > 5 or successful_actions < actions_to_be_executed:
-        publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
+        publish_message(get_slack_web_hook_url(), json.dumps(guardduty_finding))
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
     )
