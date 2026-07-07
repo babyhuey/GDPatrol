@@ -232,8 +232,10 @@ def _create_and_track_deny_rule(ip_address: str, nacl_id: str, rule_number: int)
 
 def delete_oldest_acl_entry(nacl_id: str) -> None:
     """
-    Delete the oldest ACL entry for a given Network ACL ID.
-    If DynamoDB is empty, fall back to enumerating actual NACL entries from AWS.
+    Delete the oldest ACL entry for a given Network ACL ID that still exists in AWS,
+    reconciling any stale DynamoDB rows encountered along the way — one drifted row must
+    not defeat the cleanup, or the caller's create-retry fails without freeing a slot.
+    If DynamoDB has no live rows, fall back to enumerating actual NACL entries from AWS.
     """
     try:
         response = dynamodb_client.query(
@@ -242,56 +244,58 @@ def delete_oldest_acl_entry(nacl_id: str) -> None:
             ExpressionAttributeNames={"#pk": "network_acl_id"},
             ExpressionAttributeValues={":pk_value": {"S": nacl_id}},
         )
-        items = response.get("Items", [])
-        if not items:
-            logger.warning(f"No entries found in DynamoDB for NACL {nacl_id}. Falling back to AWS NACL entries.")
-            nacl = ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]
-            # Only consider GDPatrol-managed rules: ingress deny rules with a /32 CidrBlock.
-            # This excludes the implicit default-deny (0.0.0.0/0 @ 32767) and customer subnet-level denies.
-            deny_rules = [
-                rule
-                for rule in nacl["Entries"]
-                if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
-            ]
-            if not deny_rules:
-                logger.warning(f"No GDPatrol-managed deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
+        # Query returns ascending by created_at (the sort key), so oldest first.
+        for oldest_item in response.get("Items", []):
+            logger.info(f"Deleting network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
+            rule_deleted = True
+            try:
+                ec2_client.delete_network_acl_entry(
+                    Egress=False,
+                    DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
+                    NetworkAclId=nacl_id,
+                    RuleNumber=int(oldest_item["rule_number"]["S"]),
+                )
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != "InvalidNetworkAclEntry.NotFound":
+                    raise
+                # AWS and DynamoDB have drifted apart; reconcile by removing the stale tracking
+                # row and keep walking to the next-oldest instead of returning without freeing anything.
+                rule_deleted = False
+                logger.warning(f"Rule {oldest_item['rule_number']['S']} not found in NACL {nacl_id}; reconciling stale DynamoDB row.")
+
+            dynamodb_client.delete_item(
+                TableName=GD_PATROL_TABLE,
+                Key={
+                    "network_acl_id": {"S": nacl_id},
+                    "created_at": {"S": oldest_item["created_at"]["S"]},
+                },
+            )
+            if rule_deleted:
+                logger.info(f"Deleted network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
                 return
-            # New rules get decreasing numbers, so the HIGHEST rule number is the oldest.
-            oldest_rule = max(deny_rules, key=lambda r: r["RuleNumber"])
-            logger.info(f"Deleting fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
-            ec2_client.delete_network_acl_entry(
-                Egress=False,
-                DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
-                NetworkAclId=nacl_id,
-                RuleNumber=oldest_rule["RuleNumber"],
-            )
-            logger.info(f"Deleted fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
+
+        logger.warning(f"No live entries found in DynamoDB for NACL {nacl_id}. Falling back to AWS NACL entries.")
+        nacl = ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]
+        # Only consider GDPatrol-managed rules: ingress deny rules with a /32 CidrBlock.
+        # This excludes the implicit default-deny (0.0.0.0/0 @ 32767) and customer subnet-level denies.
+        deny_rules = [
+            rule
+            for rule in nacl["Entries"]
+            if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
+        ]
+        if not deny_rules:
+            logger.warning(f"No GDPatrol-managed deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
             return
-        oldest_item = items[0]
-        logger.info(f"Deleting network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
-
-        try:
-            ec2_client.delete_network_acl_entry(
-                Egress=False,
-                DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
-                NetworkAclId=nacl_id,
-                RuleNumber=int(oldest_item["rule_number"]["S"]),
-            )
-        except ClientError as error:
-            if error.response.get("Error", {}).get("Code") != "InvalidNetworkAclEntry.NotFound":
-                raise
-            # AWS and DynamoDB have drifted apart; reconcile by removing the stale tracking row below,
-            # instead of leaving it to be returned as "oldest" forever.
-            logger.warning(f"Rule {oldest_item['rule_number']['S']} not found in NACL {nacl_id}; reconciling stale DynamoDB row.")
-
-        dynamodb_client.delete_item(
-            TableName=GD_PATROL_TABLE,
-            Key={
-                "network_acl_id": {"S": nacl_id},
-                "created_at": {"S": oldest_item["created_at"]["S"]},
-            },
+        # New rules get decreasing numbers, so the HIGHEST rule number is the oldest.
+        oldest_rule = max(deny_rules, key=lambda r: r["RuleNumber"])
+        logger.info(f"Deleting fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
+        ec2_client.delete_network_acl_entry(
+            Egress=False,
+            DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
+            NetworkAclId=nacl_id,
+            RuleNumber=oldest_rule["RuleNumber"],
         )
-        logger.info(f"Deleted network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
+        logger.info(f"Deleted fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
     except Exception as error:
         logger.error(f"Error deleting the oldest ACL entry: {error}")
         # Do not raise here; just log the error and continue

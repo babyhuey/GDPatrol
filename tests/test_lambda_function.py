@@ -754,6 +754,70 @@ def test_delete_oldest_acl_entry_reconciles_stale_dynamodb_row(mock_ec2, mock_dy
 
 @patch("GDPatrol.lambda_function.dynamodb_client")
 @patch("GDPatrol.lambda_function.ec2_client")
+def test_delete_oldest_acl_entry_skips_stale_rows_until_live_rule_freed(mock_ec2, mock_dynamo):
+    """One stale DynamoDB row must not defeat the cleanup: the function must reconcile it
+    and keep walking to the next-oldest row until a rule that actually exists is deleted.
+
+    Regression test for prod finding f6cd1c81 (2026-07-07): delete-oldest removed a stale
+    row for a rule AWS no longer had, freed no NACL slot, and the blacklist retry failed,
+    producing a needs-review Slack alert while the finding's twin invocation succeeded."""
+    from botocore.exceptions import ClientError
+
+    mock_dynamo.query.return_value = {
+        "Items": [
+            {"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "1000.0"}, "rule_number": {"S": "2"}},
+            {"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "2000.0"}, "rule_number": {"S": "99"}},
+        ]
+    }
+    mock_ec2.delete_network_acl_entry.side_effect = [
+        ClientError({"Error": {"Code": "InvalidNetworkAclEntry.NotFound", "Message": "not found"}}, "DeleteNetworkAclEntry"),
+        None,
+    ]
+
+    delete_oldest_acl_entry("acl-123")
+
+    assert mock_ec2.delete_network_acl_entry.call_count == 2
+    assert mock_ec2.delete_network_acl_entry.call_args_list[1][1]["RuleNumber"] == 99
+    # Both rows removed: the stale one reconciled, the live one deleted normally.
+    deleted_keys = [c[1]["Key"]["created_at"]["S"] for c in mock_dynamo.delete_item.call_args_list]
+    assert deleted_keys == ["1000.0", "2000.0"]
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_delete_oldest_acl_entry_all_rows_stale_falls_back_to_aws(mock_ec2, mock_dynamo):
+    """If every tracked row is stale, fall back to enumerating the real NACL so a slot
+    still gets freed."""
+    from botocore.exceptions import ClientError
+
+    mock_dynamo.query.return_value = {
+        "Items": [{"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "1000.0"}, "rule_number": {"S": "2"}}]
+    }
+    not_found = ClientError(
+        {"Error": {"Code": "InvalidNetworkAclEntry.NotFound", "Message": "not found"}}, "DeleteNetworkAclEntry"
+    )
+    mock_ec2.delete_network_acl_entry.side_effect = [not_found, None]
+    mock_ec2.describe_network_acls.return_value = {
+        "NetworkAcls": [
+            {
+                "Entries": [
+                    {"Egress": False, "RuleAction": "deny", "RuleNumber": 10, "CidrBlock": "1.2.3.4/32"},
+                    {"Egress": False, "RuleAction": "deny", "RuleNumber": 20, "CidrBlock": "5.6.7.8/32"},
+                ]
+            }
+        ]
+    }
+
+    delete_oldest_acl_entry("acl-123")
+
+    # Stale row reconciled, then the oldest (highest-numbered) real GDPatrol rule deleted.
+    mock_dynamo.delete_item.assert_called_once()
+    assert mock_ec2.delete_network_acl_entry.call_count == 2
+    assert mock_ec2.delete_network_acl_entry.call_args_list[1][1]["RuleNumber"] == 20
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.ec2_client")
 def test_delete_oldest_acl_entry_other_errors_do_not_touch_dynamodb(mock_ec2, mock_dynamo):
     """A non-NotFound AWS error must not be treated as drift — the DynamoDB row must survive for retry."""
     from botocore.exceptions import ClientError
