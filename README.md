@@ -28,12 +28,15 @@ The system requires two DynamoDB tables:
 - `SLACK_WEB_HOOK_URL` - Optional: Webhook URL for Slack notifications
 - `GD_PATROL_TABLE` (default: "GDPatrol") - DynamoDB table name
 - `GD_PATROL_LOCK_TABLE` (default: "GDPatrol_lock") - DynamoDB lock table name
+- `GD_PATROL_PROTECTED_USERS` - Optional: comma-separated IAM users that must never be auto-disabled (root is always protected)
+- `GD_PATROL_NACL_RULE_LIMIT` (default: 20) - Set to match the account's "Rules per network ACL" quota if raised
 
 ## AI-Powered Analysis
 
-GDPatrol uses Claude Sonnet 4.6 on AWS Bedrock to provide AI-enhanced security analysis for high-severity
-findings. When a finding with severity > 5 triggers a Slack notification, the alert is first sent to Claude
-for analysis. The AI provides:
+GDPatrol uses Claude Sonnet 4.6 on AWS Bedrock to provide AI-enhanced security analysis for notable
+findings. A Slack notification is sent when a finding's severity is greater than 5, or when a playbook
+action that was attempted failed (actions skipped because they fall below the execution gate do not
+notify). Before posting, the alert is first sent to Claude for analysis. The AI provides:
 
 - A human-friendly explanation of the alert
 - Potential impact and severity assessment
@@ -101,9 +104,9 @@ Then run the deployment file:
 python3 deploy.py
 ```
 
-To enable Slack notifications, set the `SLACK_WEB_HOOK_URL` environment variable on the deployed
-`GDPatrol` Lambda function (via the AWS Console or CLI) after running `deploy.py` — the deploy script
-does not set this automatically.
+To enable Slack notifications, export `SLACK_WEB_HOOK_URL` (or pass `--slack-webhook-url`) before
+running `deploy.py` — the script passes it through to the Lambda's environment. See
+`deploy.env.example` for the full set of deploy-time variables.
 
 The deployment script deploys to all enabled regions sequentially and requires the following permissions:
 ```
@@ -132,10 +135,12 @@ You can easily create your own playbooks by just adding or removing the actions 
 for the desired finding type.
 
 By default, all findings are assigned a reliability value of 5: the reliability is then added to the "severity" value
-found in the finding JSON, and the actions are only executed if the sum of the two values is higher than 10.
+found in the finding JSON, and the actions are only executed if the sum of the two values is 10 or higher.
 
-This ensures that, by default, only the playbooks for the GuardDuty findings with a severity of 6 or higher will be executed, while
+This ensures that, by default, only the playbooks for the GuardDuty findings with a severity of 5 or higher will be executed, while
 providing a way to effectively yet simply modify the behavior by modifying the reliability value of the config file.
+The `disable_account` action has a stricter standalone gate — it requires severity >= 7 and a combined
+score above 13 — because no automated rollback exists for it.
 
 Some RDS finding types have higher reliability scores to ensure they trigger at lower severity thresholds:
 - Successful brute force: reliability 10 (always triggers)
