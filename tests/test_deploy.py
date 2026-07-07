@@ -136,26 +136,33 @@ def test_guardduty_member_account_error_does_not_abort_region(deploy_harness):
     assert lmb.create_function.called
 
 
-def test_slack_webhook_env_var_included_when_set(deploy_harness, monkeypatch):
+def test_slack_webhook_written_to_ssm_not_env(deploy_harness, monkeypatch):
+    """The webhook goes to a per-region SecureString SSM parameter, never the Lambda env."""
     monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/from-env")
 
     deploy.run()
 
     for region in deploy_harness.regions:
+        ssm = deploy_harness.clients[("ssm", region)]
+        ssm.put_parameter.assert_called_once_with(
+            Name="/gdpatrol/slack_webhook_url",
+            Value="https://hooks.slack.com/services/from-env",
+            Type="SecureString",
+            Overwrite=True,
+        )
         lmb = deploy_harness.clients[("lambda", region)]
         env_vars = lmb.create_function.call_args.kwargs["Environment"]["Variables"]
-        assert env_vars["SLACK_WEB_HOOK_URL"] == "https://hooks.slack.com/services/from-env"
+        assert "SLACK_WEB_HOOK_URL" not in env_vars
 
 
-def test_slack_webhook_env_var_absent_when_unset(deploy_harness, monkeypatch, capsys):
+def test_slack_webhook_param_not_written_when_unset(deploy_harness, monkeypatch, capsys):
     monkeypatch.delenv("SLACK_WEB_HOOK_URL", raising=False)
 
     deploy.run()
 
     for region in deploy_harness.regions:
-        lmb = deploy_harness.clients[("lambda", region)]
-        env_vars = lmb.create_function.call_args.kwargs["Environment"]["Variables"]
-        assert "SLACK_WEB_HOOK_URL" not in env_vars
+        ssm = deploy_harness.clients.get(("ssm", region))
+        assert ssm is None or not ssm.put_parameter.called
     assert "WARNING: SLACK_WEB_HOOK_URL is not set" in capsys.readouterr().out
 
 

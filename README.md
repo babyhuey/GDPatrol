@@ -25,7 +25,7 @@ The system requires two DynamoDB tables:
 
 ### Environment Variables
 - `DELETE_NACL_ENTRY_DRY_RUN` (default: "False") - Set to "True" to test NACL entry deletion without actually deleting
-- `SLACK_WEB_HOOK_URL` - Optional: Webhook URL for Slack notifications
+- `SLACK_WEB_HOOK_URL` - Optional: fallback webhook URL for Slack notifications (normally read from the `/gdpatrol/slack_webhook_url` SSM parameter instead)
 - `GD_PATROL_TABLE` (default: "GDPatrol") - DynamoDB table name
 - `GD_PATROL_LOCK_TABLE` (default: "GDPatrol_lock") - DynamoDB lock table name
 - `GD_PATROL_PROTECTED_USERS` - Optional: comma-separated IAM users that must never be auto-disabled (root is always protected)
@@ -105,8 +105,9 @@ python3 deploy.py
 ```
 
 To enable Slack notifications, export `SLACK_WEB_HOOK_URL` (or pass `--slack-webhook-url`) before
-running `deploy.py` — the script passes it through to the Lambda's environment. See
-`deploy.env.example` for the full set of deploy-time variables.
+running `deploy.py` — the script stores it per region as a SecureString SSM parameter
+(`/gdpatrol/slack_webhook_url`), which the Lambda reads at runtime; the URL never appears in the
+function's environment configuration. See `deploy.env.example` for the full set of deploy-time variables.
 
 The deployment script deploys to all enabled regions sequentially and requires the following permissions:
 ```
@@ -121,6 +122,9 @@ List Rules, List Targets By Rule, Remove Targets, Delete Rule, Put Rule, Put Tar
 
 GuardDuty:
 List Detectors, Create Detector, Update Detector
+
+SSM:
+Put Parameter
 
 Bedrock:
 InvokeModel (anthropic.claude-sonnet-4-6)
