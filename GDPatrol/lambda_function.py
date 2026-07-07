@@ -4,20 +4,53 @@ import logging
 import os
 import time
 import uuid
+import socket
 from inspect import stack
-from socket import gaierror, gethostbyname
 from typing import Any, Dict, List
 import requests
 import ipaddress
 
 import boto3
+from botocore.exceptions import ClientError
 
-# Use uppercase for environment variable
-slack_web_hook_url = os.environ.get("SLACK_WEB_HOOK_URL")
+# The Slack webhook lives in a SecureString SSM parameter (written per region by
+# deploy.py) so it never appears in the Lambda's environment configuration. The
+# SLACK_WEB_HOOK_URL env var remains as a fallback for local runs and pre-SSM deploys.
+SLACK_WEBHOOK_PARAM = "/gdpatrol/slack_webhook_url"
+_slack_web_hook_url = None
+
+
+def get_slack_web_hook_url():
+    global _slack_web_hook_url
+    env_url = os.environ.get("SLACK_WEB_HOOK_URL")
+    if env_url:
+        return env_url
+    if _slack_web_hook_url is None:
+        try:
+            ssm_client = boto3.client("ssm")
+            _slack_web_hook_url = ssm_client.get_parameter(Name=SLACK_WEBHOOK_PARAM, WithDecryption=True)["Parameter"]["Value"]
+        except Exception as e:
+            logger.error(f"GDPatrol: Could not read Slack webhook from SSM parameter {SLACK_WEBHOOK_PARAM}: {e}")
+            return None
+    return _slack_web_hook_url
+
 
 # Use environment variables for table names
 GD_PATROL_TABLE = os.environ.get("GD_PATROL_TABLE", "GDPatrol")
 GD_PATROL_LOCK_TABLE = os.environ.get("GD_PATROL_LOCK_TABLE", "GDPatrol_lock")
+# All NACL-mutating actions serialize on this single lock id, since blacklist_ip/whitelist_ip
+# each mutate every NACL in the account rather than just one keyed by IP.
+GD_PATROL_NACL_LOCK_ID = "gdpatrol-nacl"
+
+# IAM users that must never be auto-disabled by disable_account / disable_ec2_access /
+# disable_sg_access. Comma-separated in GD_PATROL_PROTECTED_USERS; root is always protected.
+PROTECTED_USERS = {u.strip().lower() for u in os.environ.get("GD_PATROL_PROTECTED_USERS", "").split(",") if u.strip()} | {"root"}
+
+# Max ingress deny rules GDPatrol maintains per NACL. AWS default is 20 rules/direction,
+# raisable to 40 via the "Rules per network ACL" (L-2AEEBF1A) Service Quota. Set
+# GD_PATROL_NACL_RULE_LIMIT to match the account's actual quota so GDPatrol uses the
+# available headroom instead of self-capping at 20.
+NACL_RULE_LIMIT = int(os.environ.get("GD_PATROL_NACL_RULE_LIMIT", "20"))
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -100,10 +133,15 @@ def enhance_message_with_claude(message_data: Dict[str, Any]) -> Dict[str, Any]:
     Enhance the message using Claude Sonnet on AWS Bedrock.
     """
     try:
-        prompt = f"""You are a security expert analyzing a GuardDuty finding. Provide a concise analysis:
+        prompt = f"""You are a security expert triaging a GuardDuty finding that GDPatrol has already processed automatically. The alert data below reports GDPatrol's response in its "Status" and "Auto-remediation" fields:
+- Status "remediated": GDPatrol already executed the listed auto-remediation (e.g. blocked the source IP, quarantined the instance). Acknowledge what was done and recommend ONLY the human follow-up still needed — do NOT recommend actions GDPatrol already performed.
+- Status "needs-review": a playbook exists but GDPatrol did not fully act (below its action threshold, or a protected account). Note why, and advise whether a human should act manually.
+- Status "no-playbook": nothing was auto-remediated — recommend the full investigation and remediation.
+
+Provide a concise analysis:
 1. What this alert means in plain language
 2. Potential impact and severity
-3. Recommended investigation and remediation steps
+3. Recommended next steps, following the guidance above (never repeat actions already completed)
 
 Alert data:
 {json.dumps(message_data, indent=2)}
@@ -166,10 +204,60 @@ def create_network_acl_entry(ip_address: str, nacl_id: str, rule_number: int) ->
         raise
 
 
+def _next_free_ingress_deny_rule_number(entries: List[Dict[str, Any]]) -> int | None:
+    """
+    Return an unused ingress rule number for a new ingress deny rule, or None if the NACL
+    has no free ingress rule numbers left.
+
+    Considers ALL ingress entries (allow and deny) so the result never collides with a
+    pre-existing rule — ingress and egress rule numbers are independent namespaces, so
+    egress entries are ignored.
+
+    Preference order: one below the current lowest GDPatrol deny rule (the existing
+    decrement scheme), or the next free number below that. If the low end (near 1) is
+    exhausted, search downward from the high end (32766; 32767 is the implicit default-deny)
+    instead of evicting whoever holds a fixed slot.
+    """
+    used = {entry["RuleNumber"] for entry in entries if not entry["Egress"]}
+    deny_numbers = [entry["RuleNumber"] for entry in entries if not entry["Egress"] and entry["RuleAction"] == "deny"]
+    start = (min(deny_numbers) - 1) if deny_numbers else 100
+
+    candidate = start
+    while candidate >= 1:
+        if candidate not in used:
+            return candidate
+        candidate -= 1
+
+    # Low end exhausted (or fully occupied); search down from the high end instead.
+    candidate = 32766
+    floor = max(start, 0)
+    while candidate > floor:
+        if candidate not in used:
+            return candidate
+        candidate -= 1
+
+    return None
+
+
+def _create_and_track_deny_rule(ip_address: str, nacl_id: str, rule_number: int) -> None:
+    """Create the deny rule in AWS and record it in DynamoDB so it can be found again as "oldest"."""
+    create_network_acl_entry(ip_address, nacl_id, rule_number)
+    dynamodb_client.put_item(
+        TableName=GD_PATROL_TABLE,
+        Item={
+            "network_acl_id": {"S": nacl_id},
+            "created_at": {"S": str(time.time())},
+            "rule_number": {"S": str(rule_number)},
+        },
+    )
+
+
 def delete_oldest_acl_entry(nacl_id: str) -> None:
     """
-    Delete the oldest ACL entry for a given Network ACL ID.
-    If DynamoDB is empty, fall back to enumerating actual NACL entries from AWS.
+    Delete the oldest ACL entry for a given Network ACL ID that still exists in AWS,
+    reconciling any stale DynamoDB rows encountered along the way — one drifted row must
+    not defeat the cleanup, or the caller's create-retry fails without freeing a slot.
+    If DynamoDB has no live rows, fall back to enumerating actual NACL entries from AWS.
     """
     try:
         response = dynamodb_client.query(
@@ -178,50 +266,64 @@ def delete_oldest_acl_entry(nacl_id: str) -> None:
             ExpressionAttributeNames={"#pk": "network_acl_id"},
             ExpressionAttributeValues={":pk_value": {"S": nacl_id}},
         )
-        items = response.get("Items", [])
-        if not items:
-            logger.warning(f"No entries found in DynamoDB for NACL {nacl_id}. Falling back to AWS NACL entries.")
-            nacl = ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]
-            # Only consider deny, ingress rules (Egress=False, RuleAction='deny')
-            deny_rules = [rule for rule in nacl["Entries"] if not rule["Egress"] and rule["RuleAction"] == "deny"]
-            if not deny_rules:
-                logger.warning(f"No deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
-                return
-            # Find the oldest by lowest rule number
-            oldest_rule = min(deny_rules, key=lambda r: r["RuleNumber"])
-            logger.info(f"Deleting fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
-            ec2_client.delete_network_acl_entry(
-                Egress=False,
-                DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
-                NetworkAclId=nacl_id,
-                RuleNumber=oldest_rule["RuleNumber"],
-            )
-            logger.info(f"Deleted fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
-            return
-        oldest_item = items[0]
-        logger.info(f"Deleting network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
+        # Query returns ascending by created_at (the sort key), so oldest first.
+        for oldest_item in response.get("Items", []):
+            logger.info(f"Deleting network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
+            rule_deleted = True
+            try:
+                ec2_client.delete_network_acl_entry(
+                    Egress=False,
+                    DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
+                    NetworkAclId=nacl_id,
+                    RuleNumber=int(oldest_item["rule_number"]["S"]),
+                )
+            except ClientError as error:
+                if error.response.get("Error", {}).get("Code") != "InvalidNetworkAclEntry.NotFound":
+                    raise
+                # AWS and DynamoDB have drifted apart; reconcile by removing the stale tracking
+                # row and keep walking to the next-oldest instead of returning without freeing anything.
+                rule_deleted = False
+                logger.warning(f"Rule {oldest_item['rule_number']['S']} not found in NACL {nacl_id}; reconciling stale DynamoDB row.")
 
+            dynamodb_client.delete_item(
+                TableName=GD_PATROL_TABLE,
+                Key={
+                    "network_acl_id": {"S": nacl_id},
+                    "created_at": {"S": oldest_item["created_at"]["S"]},
+                },
+            )
+            if rule_deleted:
+                logger.info(f"Deleted network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
+                return
+
+        logger.warning(f"No live entries found in DynamoDB for NACL {nacl_id}. Falling back to AWS NACL entries.")
+        nacl = ec2_client.describe_network_acls(NetworkAclIds=[nacl_id])["NetworkAcls"][0]
+        # Only consider GDPatrol-managed rules: ingress deny rules with a /32 CidrBlock.
+        # This excludes the implicit default-deny (0.0.0.0/0 @ 32767) and customer subnet-level denies.
+        deny_rules = [
+            rule
+            for rule in nacl["Entries"]
+            if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
+        ]
+        if not deny_rules:
+            logger.warning(f"No GDPatrol-managed deny ingress rules found in NACL {nacl_id}. Nothing to delete.")
+            return
+        # New rules get decreasing numbers, so the HIGHEST rule number is the oldest.
+        oldest_rule = max(deny_rules, key=lambda r: r["RuleNumber"])
+        logger.info(f"Deleting fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
         ec2_client.delete_network_acl_entry(
             Egress=False,
             DryRun=os.environ.get("DELETE_NACL_ENTRY_DRY_RUN", "False").lower() == "true",
             NetworkAclId=nacl_id,
-            RuleNumber=int(oldest_item["rule_number"]["S"]),
+            RuleNumber=oldest_rule["RuleNumber"],
         )
-
-        dynamodb_client.delete_item(
-            TableName=GD_PATROL_TABLE,
-            Key={
-                "network_acl_id": {"S": nacl_id},
-                "created_at": {"S": oldest_item["created_at"]["S"]},
-            },
-        )
-        logger.info(f"Deleted network_acl rule_number = {oldest_item['rule_number']['S']} for {nacl_id}")
+        logger.info(f"Deleted fallback network_acl rule_number = {oldest_rule['RuleNumber']} for {nacl_id}")
     except Exception as error:
         logger.error(f"Error deleting the oldest ACL entry: {error}")
         # Do not raise here; just log the error and continue
 
 
-def acquire_lock(lock_table_name: str, lock_id: str, max_retries: int = 5, retry_delay: int = 2, ttl_seconds: int = 60) -> None:
+def acquire_lock(lock_table_name: str, lock_id: str, max_retries: int = 60, retry_delay: int = 3, ttl_seconds: int = 60) -> None:
     """
     Acquire a lock from a DynamoDB table. Adds a TTL to avoid deadlocks.
     """
@@ -271,21 +373,29 @@ def delete_dynamodb_rule_entries(nacl_id: str, rule_numbers: set) -> None:
     if not rule_numbers:
         return
     try:
-        response = dynamodb_client.query(
+        paginator = dynamodb_client.get_paginator("query")
+        for page in paginator.paginate(
             TableName=GD_PATROL_TABLE,
             KeyConditionExpression="#pk = :pk_value",
             ExpressionAttributeNames={"#pk": "network_acl_id"},
             ExpressionAttributeValues={":pk_value": {"S": nacl_id}},
-        )
-        for item in response.get("Items", []):
-            if int(item["rule_number"]["S"]) in rule_numbers:
-                dynamodb_client.delete_item(
-                    TableName=GD_PATROL_TABLE,
-                    Key={
-                        "network_acl_id": {"S": nacl_id},
-                        "created_at": {"S": item["created_at"]["S"]},
-                    },
-                )
+        ):
+            for item in page.get("Items", []):
+                # Skip legacy/malformed items so one bad row doesn't abort the cleanup
+                try:
+                    rule_number = int(item["rule_number"]["S"])
+                # Keep the parenthesized tuple: ruff's py314 target would otherwise strip the
+                # parens to `except KeyError, ValueError:`, a SyntaxError on Python <3.14.
+                except (KeyError, ValueError):  # fmt: skip
+                    continue
+                if rule_number in rule_numbers:
+                    dynamodb_client.delete_item(
+                        TableName=GD_PATROL_TABLE,
+                        Key={
+                            "network_acl_id": {"S": nacl_id},
+                            "created_at": {"S": item["created_at"]["S"]},
+                        },
+                    )
     except Exception as e:
         logger.error(f"Error cleaning up DynamoDB entries for NACL {nacl_id}: {e}")
 
@@ -304,8 +414,9 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
     # Use env table names if not provided
     lock_table_name = lock_table_name or GD_PATROL_LOCK_TABLE
-    # Make lock_id resource-specific
-    lock_id = lock_id or f"lock-{ip_address}"
+    # A single fixed lock id, since this function mutates every NACL in the account,
+    # not just resources related to ip_address.
+    lock_id = lock_id or GD_PATROL_NACL_LOCK_ID
     lock_acquired = False
     try:
         acquire_lock(lock_table_name, lock_id)
@@ -333,16 +444,39 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                 blocked_count += 1
                 continue
 
-            # Get all deny rules for this NACL
-            deny_rules = [rule for rule in nacl["Entries"] if not rule["Egress"] and rule["RuleAction"] == "deny"]
+            # Get all deny rules for this NACL. Only GDPatrol-managed rules (ingress deny with a
+            # /32 CidrBlock) count toward the threshold and are eligible for cleanup — this must
+            # never sweep up a customer's own deny rule (e.g. a subnet-level block, or the implicit
+            # default-deny at 32767). Same predicate as delete_oldest_acl_entry's fallback.
+            deny_rules = [
+                rule
+                for rule in nacl["Entries"]
+                if not rule["Egress"] and rule["RuleAction"] == "deny" and rule.get("CidrBlock", "").endswith("/32")
+            ]
 
-            # Check if we're approaching the limit (max 20 rules per direction)
-            if len(deny_rules) >= 19:
+            # Check if we're approaching the per-direction rule limit
+            if len(deny_rules) >= NACL_RULE_LIMIT - 1:
                 logger.warning(f"NACL {nacl['NetworkAclId']} has {len(deny_rules)} deny rules, performing aggressive cleanup.")
-                # New rules get decreasing numbers (min - 1), so the lowest rule numbers are the most recent
-                deny_rules_sorted = sorted(deny_rules, key=lambda r: r["RuleNumber"])
-                # Keep only the 10 most recent (lowest) rule numbers
-                rules_to_delete = deny_rules_sorted[10:]
+                # Rule numbers no longer indicate age once the allocator falls back to the high end,
+                # so order by the DynamoDB created_at tracking data instead. Rules with no tracking
+                # row have drifted from DynamoDB; treat them as oldest (safe to evict first) via the
+                # "" sentinel, which sorts before any real timestamp string.
+                created_at_by_rule_number: Dict[int, str] = {}
+                try:
+                    tracking = dynamodb_client.query(
+                        TableName=GD_PATROL_TABLE,
+                        KeyConditionExpression="#pk = :pk_value",
+                        ExpressionAttributeNames={"#pk": "network_acl_id"},
+                        ExpressionAttributeValues={":pk_value": {"S": nacl["NetworkAclId"]}},
+                    )
+                    for item in tracking.get("Items", []):
+                        created_at_by_rule_number[int(item["rule_number"]["S"])] = item["created_at"]["S"]
+                except Exception as e:
+                    logger.error(f"Error querying DynamoDB for NACL {nacl['NetworkAclId']} during cleanup: {e}")
+                # Newest first, so the most recent half is kept and the remainder (oldest) deleted.
+                deny_rules_sorted = sorted(deny_rules, key=lambda r: created_at_by_rule_number.get(r["RuleNumber"], ""), reverse=True)
+                # Keep the most recent half of the limit; evict the rest to make headroom.
+                rules_to_delete = deny_rules_sorted[max(1, NACL_RULE_LIMIT // 2) :]
                 deleted_rule_numbers = set()
                 for rule in rules_to_delete:
                     try:
@@ -357,46 +491,18 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                         logger.error(f"Failed to delete deny rule {rule['RuleNumber']}: {e}")
                 delete_dynamodb_rule_entries(nacl["NetworkAclId"], deleted_rule_numbers)
 
-            if not deny_rules:
-                # If no deny rules exist, start with rule number 100
-                target_rule_number = 100
-            else:
-                # Find the minimum rule number among deny rules
-                min_rule_id = min(rule["RuleNumber"] for rule in deny_rules)
-                # If we hit the lower bound, wrap around to a high rule number (e.g., 32700)
-                if min_rule_id <= 2:
-                    logger.warning(f"Rule number {min_rule_id} is too low; wrapping to 32700 for NACL {nacl['NetworkAclId']}")
-                    target_rule_number = 32700
-                    # Delete any existing rule at 32700 before creating
-                    for rule in nacl["Entries"]:
-                        if not rule["Egress"] and rule["RuleAction"] == "deny" and rule["RuleNumber"] == 32700:
-                            try:
-                                ec2_client.delete_network_acl_entry(
-                                    Egress=False,
-                                    NetworkAclId=nacl["NetworkAclId"],
-                                    RuleNumber=32700,
-                                )
-                                delete_dynamodb_rule_entries(nacl["NetworkAclId"], {32700})
-                                logger.info(f"Deleted existing deny rule 32700 in NACL {nacl['NetworkAclId']}")
-                            except Exception as e:
-                                logger.error(f"Failed to delete existing rule 32700: {e}")
-                    # (Do not continue; proceed to create the new rule at 32700)
-                else:
-                    target_rule_number = min_rule_id - 1
+            target_rule_number = _next_free_ingress_deny_rule_number(nacl["Entries"])
+            if target_rule_number is None:
+                logger.warning(f"No free ingress rule numbers in NACL {nacl['NetworkAclId']}; deleting oldest entry to make room")
+                delete_oldest_acl_entry(nacl["NetworkAclId"])
+                refreshed = ec2_client.describe_network_acls(NetworkAclIds=[nacl["NetworkAclId"]])["NetworkAcls"][0]
+                target_rule_number = _next_free_ingress_deny_rule_number(refreshed["Entries"])
+                if target_rule_number is None:
+                    logger.error(f"NACL {nacl['NetworkAclId']} still has no free ingress rule numbers after cleanup; skipping")
+                    continue
 
             try:
-                create_network_acl_entry(ip_address, nacl["NetworkAclId"], target_rule_number)
-
-                # Store the new entry in DynamoDB
-                dynamodb_client.put_item(
-                    TableName=GD_PATROL_TABLE,
-                    Item={
-                        "network_acl_id": {"S": nacl["NetworkAclId"]},
-                        "created_at": {"S": str(time.time())},
-                        "rule_number": {"S": str(target_rule_number)},
-                    },
-                )
-
+                _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], target_rule_number)
                 logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']}")
                 blocked_count += 1
 
@@ -407,21 +513,35 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
                         logger.info(f"Network ACL limit exceeded for {nacl['NetworkAclId']}, attempting to delete oldest entry")
                         delete_oldest_acl_entry(nacl["NetworkAclId"])
                         # Retry creating the entry after deleting the oldest one
-                        create_network_acl_entry(ip_address, nacl["NetworkAclId"], target_rule_number)
-                        # Store the new entry in DynamoDB
-                        dynamodb_client.put_item(
-                            TableName=GD_PATROL_TABLE,
-                            Item={
-                                "network_acl_id": {"S": nacl["NetworkAclId"]},
-                                "created_at": {"S": str(time.time())},
-                                "rule_number": {"S": str(target_rule_number)},
-                            },
-                        )
+                        _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], target_rule_number)
                         logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} after deleting oldest entry")
                         blocked_count += 1
                     except Exception as retry_error:
                         logger.error(f"Failed to create entry after deleting oldest: {retry_error}")
                         # Try the next NACL
+                        continue
+                elif "NetworkAclEntryAlreadyExists" in str(error):
+                    # Our snapshot of the NACL was stale (a concurrent mutation took this number);
+                    # retry with a freshly-computed free number instead of failing outright.
+                    logger.warning(f"Rule number {target_rule_number} already exists in {nacl['NetworkAclId']}; retrying with another")
+                    retried_successfully = False
+                    for _ in range(3):
+                        refreshed = ec2_client.describe_network_acls(NetworkAclIds=[nacl["NetworkAclId"]])["NetworkAcls"][0]
+                        retry_rule_number = _next_free_ingress_deny_rule_number(refreshed["Entries"])
+                        if retry_rule_number is None:
+                            break
+                        try:
+                            _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], retry_rule_number)
+                            logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} at retried rule {retry_rule_number}")
+                            blocked_count += 1
+                            retried_successfully = True
+                            break
+                        except Exception as retry_error:
+                            if "NetworkAclEntryAlreadyExists" not in str(retry_error):
+                                logger.error(f"Failed to create entry at retried rule number: {retry_error}")
+                                break
+                    if not retried_successfully:
+                        logger.error(f"Could not blacklist {ip_address} in NACL {nacl['NetworkAclId']}: no free rule number available")
                         continue
                 else:
                     logger.error(f"Error creating network_acl entry: {error}")
@@ -442,26 +562,55 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
 
 def whitelist_ip(ip_address):
     try:
+        ipaddress.ip_address(ip_address)
+    except ValueError:
+        logger.error(f"Invalid IP address: {ip_address}")
+        return False
+
+    lock_acquired = False
+    try:
+        acquire_lock(GD_PATROL_LOCK_TABLE, GD_PATROL_NACL_LOCK_ID)
+        lock_acquired = True
+
+        removed_count = 0
+        all_deleted = True
         paginator = ec2_client.get_paginator("describe_network_acls")
         for page in paginator.paginate():
             for nacl in page["NetworkAcls"]:
                 removed_rule_numbers = set()
                 for rule in nacl["Entries"]:
                     if rule.get("CidrBlock") == f"{ip_address}/32":
-                        ec2_client.delete_network_acl_entry(
-                            NetworkAclId=nacl["NetworkAclId"],
-                            Egress=rule["Egress"],
-                            RuleNumber=rule["RuleNumber"],
-                        )
+                        # Per-rule handling: a failed delete (e.g. a concurrent run already
+                        # removed it) must not stop the DynamoDB cleanup for rules that
+                        # were successfully deleted, or the table drifts again
+                        try:
+                            ec2_client.delete_network_acl_entry(
+                                NetworkAclId=nacl["NetworkAclId"],
+                                Egress=rule["Egress"],
+                                RuleNumber=rule["RuleNumber"],
+                            )
+                        except Exception as e:
+                            logger.error(f"GDPatrol: Error deleting rule {rule['RuleNumber']} in NACL {nacl['NetworkAclId']}: {e}")
+                            all_deleted = False
+                            continue
+                        removed_count += 1
                         if not rule["Egress"]:
                             removed_rule_numbers.add(rule["RuleNumber"])
                 delete_dynamodb_rule_entries(nacl["NetworkAclId"], removed_rule_numbers)
-        logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}")
-        return True
+
+        if removed_count == 0:
+            logger.warning(f"GDPatrol: No matching rules found to whitelist {ip_address}")
+            return False
+        if all_deleted:
+            logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {ip_address}")
+        return all_deleted
 
     except Exception as e:
         logger.error(f"GDPatrol: Error executing {stack()[0][3]} - {e}")
         return False
+    finally:
+        if lock_acquired:
+            release_lock(GD_PATROL_LOCK_TABLE, GD_PATROL_NACL_LOCK_ID)
 
 
 def quarantine_instance(instance_id, vpc_id):
@@ -489,8 +638,12 @@ def quarantine_instance(instance_id, vpc_id):
             ],
         )
 
-        # NOTE: Assign security group to instance
-        client.modify_instance_attribute(InstanceId=instance_id, Groups=[sg_id])
+        # NOTE: Assign the security group to every ENI — modify_instance_attribute only
+        # touches the primary interface, leaving other ENIs unisolated.
+        instance_described = client.describe_instances(InstanceIds=[instance_id])
+        network_interfaces = instance_described["Reservations"][0]["Instances"][0]["NetworkInterfaces"]
+        for eni in network_interfaces:
+            client.modify_network_interface_attribute(NetworkInterfaceId=eni["NetworkInterfaceId"], Groups=[sg_id])
 
         logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}")
         return True
@@ -516,7 +669,15 @@ def snapshot_instance(instance_id):
         return False
 
 
+def _is_protected_user(username) -> bool:
+    """True if the IAM user is on the protected list and must not be auto-disabled."""
+    return bool(username) and username.lower() in PROTECTED_USERS
+
+
 def disable_account(username):
+    if _is_protected_user(username):
+        logger.warning(f"GDPatrol: {username} is a protected user; skipping {stack()[0][3]}")
+        return False
     try:
         client = boto3.client("iam")
         client.put_user_policy(
@@ -532,6 +693,9 @@ def disable_account(username):
 
 
 def disable_ec2_access(username):
+    if _is_protected_user(username):
+        logger.warning(f"GDPatrol: {username} is a protected user; skipping {stack()[0][3]}")
+        return False
     try:
         client = boto3.client("iam")
         client.put_user_policy(
@@ -561,6 +725,9 @@ def enable_ec2_access(username):
 
 
 def disable_sg_access(username):
+    if _is_protected_user(username):
+        logger.warning(f"GDPatrol: {username} is a protected user; skipping {stack()[0][3]}")
+        return False
     try:
         client = boto3.client("iam")
         client.put_user_policy(
@@ -596,25 +763,46 @@ def enable_sg_access(username):
 
 
 def asg_detach_instance(instance_id):
+    if not instance_id:
+        logger.error(f"GDPatrol: {stack()[0][3]} called without an instance_id")
+        return False
     try:
         client = boto3.client("autoscaling")
         response = client.describe_auto_scaling_instances(InstanceIds=[instance_id], MaxRecords=1)
-        asg_name = None
         instances = response["AutoScalingInstances"]
-        if instances:
-            asg_name = instances[0]["AutoScalingGroupName"]
+        if not instances:
+            logger.warning(f"GDPatrol: {instance_id} is not a member of any Auto Scaling Group; nothing to detach")
+            return False
 
-        if asg_name is not None:
-            response = client.detach_instances(
-                InstanceIds=[instance_id],
-                AutoScalingGroupName=asg_name,
-                ShouldDecrementDesiredCapacity=False,
-            )
+        asg_name = instances[0]["AutoScalingGroupName"]
+        client.detach_instances(
+            InstanceIds=[instance_id],
+            AutoScalingGroupName=asg_name,
+            ShouldDecrementDesiredCapacity=False,
+        )
         logger.info(f"GDPatrol: Successfully executed action {stack()[0][3]} for {instance_id}")
         return True
     except Exception as e:
         logger.error(f"GDPatrol: Error executing {stack()[0][3]} - {e}")
         return False
+
+
+def resolve_domain_a_records(domain: str, timeout: float = 5.0) -> List[str]:
+    """
+    Resolve all IPv4 (A record) addresses for a domain, bounded by a timeout so a
+    slow or hostile nameserver can't hang the invocation. Resolution errors are
+    swallowed, returning no addresses rather than raising.
+    """
+    previous_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(timeout)
+    try:
+        results = socket.getaddrinfo(domain, None, socket.AF_INET)
+        return sorted({result[4][0] for result in results})
+    except OSError as e:
+        logger.error(f"GDPatrol: Error resolving domain {domain} - {e}")
+        return []
+    finally:
+        socket.setdefaulttimeout(previous_timeout)
 
 
 class Config:
@@ -633,6 +821,7 @@ class Config:
         for playbook in self.config["playbooks"]["playbook"]:
             if playbook["type"] == self.finding_type:
                 return playbook["reliability"]
+        logger.warning(f"GDPatrol: No config entry for finding type '{self.finding_type}'; defaulting reliability to 5")
         return 5
 
 
@@ -646,13 +835,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             return
         logger.info(f"GDPatrol: Parsed Finding ID: {finding_id} - Finding Type: {finding_type}")
         config = Config(event["type"])
-        severity = int(event.get("severity", 0))
+        severity = float(event.get("severity", 0) or 0)
         count = event.get("service", {}).get("count", 0)
 
         config_actions = config.get_actions()
         config_reliability = config.get_reliability()
         resource_type = event.get("resource", {}).get("resourceType")
-    except KeyError as e:
+    except (KeyError, ValueError, TypeError, FileNotFoundError, json.JSONDecodeError) as e:
         logger.error(f"GDPatrol: Could not parse the Finding fields correctly, please verify that the JSON is correct. {e}")
         return
     instance_id = None
@@ -689,7 +878,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     for action in config_actions:
         logger.info(f"GDPatrol: Action: {action}")
         if action == "blacklist_ip":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = blacklist_ip(ip_address)
@@ -700,65 +889,74 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
                 result = blacklist_ip(ip_address)
                 successful_actions += int(result)
         elif action == "whitelist_ip":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = whitelist_ip(ip_address)
                 successful_actions += int(result)
         elif action == "blacklist_domain":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
-                try:
-                    ip_address = gethostbyname(domain)
-                    result = blacklist_ip(ip_address)
-                    successful_actions += int(result)
-                except gaierror as e:
-                    logger.error(f"GDPatrol: Error resolving domain {domain} - {e}")
+                domain_blocked = False
+                for resolved_ip in resolve_domain_a_records(domain):
+                    if blacklist_ip(resolved_ip):
+                        domain_blocked = True
+                successful_actions += int(domain_blocked)
+            elif count > 100:
+                actions_to_be_executed += 1
+                logger.info(f"GDPatrol: Executing action {action}")
+                domain_blocked = False
+                for resolved_ip in resolve_domain_a_records(domain):
+                    if blacklist_ip(resolved_ip):
+                        domain_blocked = True
+                successful_actions += int(domain_blocked)
         elif action == "quarantine_instance":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = quarantine_instance(instance_id, vpc_id)
                 successful_actions += int(result)
         elif action == "snapshot_instance":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = snapshot_instance(instance_id)
                 successful_actions += int(result)
         elif action == "disable_account":
-            if severity + config_reliability > 10:
+            # Stricter, standalone gate: no automated rollback exists for disable_account,
+            # so it requires both a high absolute severity and a high combined score.
+            if severity >= 7 and (severity + config_reliability) > 13:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = disable_account(username)
                 successful_actions += int(result)
         elif action == "disable_ec2_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = disable_ec2_access(username)
                 successful_actions += int(result)
         elif action == "enable_ec2_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = enable_ec2_access(username)
                 successful_actions += int(result)
         elif action == "disable_sg_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = disable_sg_access(username)
                 successful_actions += int(result)
         elif action == "enable_sg_access":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = enable_sg_access(username)
                 successful_actions += int(result)
         elif action == "asg_detach_instance":
-            if severity + config_reliability > 10:
+            if severity + config_reliability >= 10:
                 actions_to_be_executed += 1
                 logger.info(f"GDPatrol: Executing action {action}")
                 result = asg_detach_instance(instance_id)
@@ -767,8 +965,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     logger.info(f"GDPatrol: Executed {successful_actions}/{actions_to_be_executed} actions successfully.")
 
     event_summary = summarize_event(event)
-    event_severity = event["severity"]
-    event_count = event["service"]["count"]
+    event_service = event.get("service", {})
+    event_severity = event.get("severity", 0)
+    event_count = event_service.get("count", "N/A")
 
     # Build concise Slack fields from the summary
     fields = [
@@ -776,8 +975,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         {"title": "Account", "value": event_summary.get("account", "N/A"), "short": "true"},
         {"title": "Finding Type", "value": event_summary.get("finding_type", "N/A"), "short": "true"},
         {"title": "Severity", "value": str(event_severity), "short": "true"},
-        {"title": "First Seen", "value": event["service"]["eventFirstSeen"], "short": "true"},
-        {"title": "Last Seen", "value": event["service"]["eventLastSeen"], "short": "true"},
+        {"title": "First Seen", "value": event_service.get("eventFirstSeen", "N/A"), "short": "true"},
+        {"title": "Last Seen", "value": event_service.get("eventLastSeen", "N/A"), "short": "true"},
         {"title": "Count", "value": str(event_count), "short": "true"},
         {"title": "Action Type", "value": event_summary.get("action_type", "N/A"), "short": "true"},
     ]
@@ -810,6 +1009,35 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
         }
     )
 
+    # Status line: whether the configured playbook (if any) fully remediated the finding.
+    if total_config_actions == 0:
+        remediation_status = "no-playbook"
+    elif successful_actions == total_config_actions:
+        remediation_status = "remediated"
+    else:
+        remediation_status = "needs-review"
+    fields.append({"title": "Status", "value": remediation_status, "short": "true"})
+
+    # Concrete auto-remediation detail, so the human sees exactly what ran and the AI
+    # analysis recommends follow-up instead of repeating actions GDPatrol already took.
+    target = (
+        event_summary.get("source_ip")
+        or event_summary.get("domain")
+        or event_summary.get("instance_id")
+        or event_summary.get("username")
+        or "N/A"
+    )
+    actions_str = ", ".join(config_actions) if config_actions else "none"
+    if remediation_status == "remediated":
+        auto_remediation = f"{actions_str} → {target} (completed automatically)"
+    elif remediation_status == "needs-review":
+        auto_remediation = (
+            f"{actions_str} → {target}; only {successful_actions}/{actions_to_be_executed} ran (below action threshold or protected target)"
+        )
+    else:
+        auto_remediation = "none — no playbook configured for this finding type"
+    fields.append({"title": "Auto-remediation", "value": auto_remediation})
+
     # Timestamp for the footer, computed per invocation
     st = datetime.datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
     guardduty_finding = {
@@ -823,8 +1051,11 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             }
         ]
     }
-    if event_severity > 5:
-        publish_message(slack_web_hook_url, json.dumps(guardduty_finding))
+    # Notify on high severity, OR when an attempted action failed — decoupled from pure
+    # severity so a partially-remediated finding is never silently dropped. Actions skipped
+    # because they fell below the execution gate are by design and don't warrant an alert.
+    if severity > 5 or successful_actions < actions_to_be_executed:
+        publish_message(get_slack_web_hook_url(), json.dumps(guardduty_finding))
     logger.info(
         f"GDPatrol: Total actions: {total_config_actions} - Actions to be executed: {actions_to_be_executed} - Successful Actions: {successful_actions} - Finding ID:  {finding_id} - Finding Type: {finding_type}"
     )

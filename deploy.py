@@ -3,13 +3,13 @@ import subprocess
 import tempfile
 from os import environ, remove
 from pathlib import Path
-from random import randrange
 from shutil import copy2, copytree, make_archive, rmtree
 from time import sleep
 import boto3
 
 LAMBDA_RUNTIME = "python3.14"
 LAMBDA_REQUIREMENTS = ["requests>=2.32.0"]
+SLACK_WEBHOOK_PARAM = "/gdpatrol/slack_webhook_url"
 
 
 def build_function_zip() -> str:
@@ -66,17 +66,21 @@ def run(slack_web_hook_url=None):
         lambda_policy = lp.read()
 
     iam = boto3.client("iam")
-    # delete the role if it already exists, so it can be deployed with
-    # the latest configuration
-
+    # get-or-create the role so already-deployed Lambdas in other regions that
+    # reference it keep working during redeploy; put_role_policy is idempotent,
+    # so it's safe to call whether the role is new or already existed.
+    lambda_role_arn = None
     for response in iam.get_paginator("list_roles").paginate():
         for role in response["Roles"]:
             if role["RoleName"] == "GDPatrolRole":
-                iam.delete_role_policy(RoleName="GDPatrolRole", PolicyName="GDPatrol_lambda_policy")
-                iam.delete_role(RoleName="GDPatrolRole")
+                lambda_role_arn = role["Arn"]
+                break
+        if lambda_role_arn is not None:
+            break
 
-    created_role = iam.create_role(RoleName="GDPatrolRole", AssumeRolePolicyDocument=assume_role_policy)
-    lambda_role_arn = created_role["Role"]["Arn"]
+    if lambda_role_arn is None:
+        created_role = iam.create_role(RoleName="GDPatrolRole", AssumeRolePolicyDocument=assume_role_policy)
+        lambda_role_arn = created_role["Role"]["Arn"]
 
     iam.put_role_policy(
         RoleName="GDPatrolRole",
@@ -84,138 +88,198 @@ def run(slack_web_hook_url=None):
         PolicyDocument=lambda_policy,
     )
 
-    # Pass the Slack webhook through to the function; without it the Lambda
-    # logs "Error publishing message to Slack" and no notification is sent
     lambda_env = {"DELETE_NACL_ENTRY_DRY_RUN": "False"}
-    slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
-    if slack_web_hook_url:
-        lambda_env["SLACK_WEB_HOOK_URL"] = slack_web_hook_url
+    # IAM users exempt from auto-disable, supplied at deploy time via the
+    # GD_PATROL_PROTECTED_USERS environment variable (comma-separated) so real
+    # usernames are never committed. root is always protected in code.
+    protected_users = environ.get("GD_PATROL_PROTECTED_USERS", "")
+    if protected_users:
+        lambda_env["GD_PATROL_PROTECTED_USERS"] = protected_users
     else:
+        print("NOTE: GD_PATROL_PROTECTED_USERS not set; only root is protected from auto-disable.")
+    # Match the account's actual "Rules per network ACL" quota (default 20, raisable to 40)
+    # so GDPatrol uses the available headroom instead of self-capping at 20.
+    nacl_rule_limit = environ.get("GD_PATROL_NACL_RULE_LIMIT")
+    if nacl_rule_limit:
+        lambda_env["GD_PATROL_NACL_RULE_LIMIT"] = nacl_rule_limit
+    # The Slack webhook is stored per region as a SecureString SSM parameter instead of a
+    # Lambda environment variable, so it never appears in the function configuration.
+    slack_web_hook_url = slack_web_hook_url or environ.get("SLACK_WEB_HOOK_URL")
+    if not slack_web_hook_url:
         print("WARNING: SLACK_WEB_HOOK_URL is not set; Slack notifications will fail.")
 
+    deployed_regions = []
+    failed_regions = []
     for region in regions:
-        lmb = boto3.client("lambda", region_name=region)
-        cw_events = boto3.client("events", region_name=region)
-        gd = boto3.client("guardduty", region_name=region)
-        if not gd.list_detectors()["DetectorIds"]:
-            created_detector = gd.create_detector(Enable=True)
-            print("Created GuardDuty detector: {}".format(created_detector["DetectorId"]))
-        else:
-            # gd.update_detector(
-            #     DetectorId=gd.list_detectors()["DetectorIds"][0], Enable=True
-            # )
-            print("Detector already exists: {}".format(gd.list_detectors()["DetectorIds"][0]))
-
+        # Isolate each region's deploy: a single region raising (a member-account
+        # detector error, a mid-run file deletion, etc.) must not abort the rest
+        # of the rollout.
         try:
-            lmb.get_function(FunctionName="GDPatrol")
-            lmb.delete_function(FunctionName="GDPatrol")
-        except Exception:
-            pass
-        sleep(7)  # Lambda bug: create function right after the role deleted will cause AccessDeniedExceptionKMS error
-        # A freshly recreated IAM role can take a while to propagate, and
-        # create_function intermittently fails with "The role defined for the
-        # function cannot be assumed by Lambda" until it does — retry with backoff.
-        for attempt in range(5):
-            try:
-                lambda_response = lmb.create_function(
-                    FunctionName="GDPatrol",
-                    Runtime=LAMBDA_RUNTIME,
-                    Role=lambda_role_arn,
-                    Handler="lambda_function.lambda_handler",
-                    Code={"ZipFile": open(zipped, "rb").read()},
-                    Timeout=300,
-                    MemorySize=128,
-                    Environment={"Variables": lambda_env},
+            lmb = boto3.client("lambda", region_name=region)
+            cw_events = boto3.client("events", region_name=region)
+            gd = boto3.client("guardduty", region_name=region)
+            if slack_web_hook_url:
+                ssm = boto3.client("ssm", region_name=region)
+                ssm.put_parameter(
+                    Name=SLACK_WEBHOOK_PARAM,
+                    Value=slack_web_hook_url,
+                    Type="SecureString",
+                    Overwrite=True,
                 )
-                break
-            except lmb.exceptions.InvalidParameterValueException as e:
-                if "cannot be assumed" not in str(e) or attempt == 4:
-                    raise
-                print("Role not yet assumable in region {}, retrying...".format(str(region)))
-                sleep(10)
-        target_arn = lambda_response["FunctionArn"]
-        target_id = "Id" + str(randrange(10**11, 10**12))
+            detector_ids = gd.list_detectors()["DetectorIds"]
+            if not detector_ids:
+                created_detector = gd.create_detector(Enable=True)
+                print("Created GuardDuty detector: {}".format(created_detector["DetectorId"]))
+            else:
+                det_id = detector_ids[0]
+                # Only re-enable if it is actually disabled, and tolerate member/delegated-admin
+                # accounts where the member cannot manage detector enablement (the GuardDuty
+                # administrator account owns it) — update_detector raises BadRequestException there.
+                try:
+                    if gd.get_detector(DetectorId=det_id).get("Status") != "ENABLED":
+                        gd.update_detector(DetectorId=det_id, Enable=True)
+                        print("Re-enabled GuardDuty detector: {}".format(det_id))
+                    else:
+                        print("Detector already enabled: {}".format(det_id))
+                except Exception as e:
+                    print("Could not manage detector {} (enablement may be org-managed): {}".format(det_id, e))
 
-        # Remove targets and delete the CloudWatch rule before recreating it
-        rules = cw_events.list_rules(NamePrefix="GDPatrol")["Rules"]
-        for rule in rules:
-            if rule["Name"] == "GDPatrol":
-                targets = cw_events.list_targets_by_rule(Rule=rule["Name"])["Targets"]
-                for target in targets:
-                    cw_events.remove_targets(Rule=rule["Name"], Ids=[target["Id"]])
-                cw_events.delete_rule(Name="GDPatrol")
-        created_rule = cw_events.put_rule(
-            Name="GDPatrol",
-            EventPattern='{"source":["aws.guardduty"],"detail-type":["GuardDuty Finding"]}',
-        )
-        cw_events.put_targets(
-            Rule="GDPatrol",
-            Targets=[{"Id": target_id, "Arn": target_arn, "InputPath": "$.detail"}],
-        )
+            sleep(7)  # Lambda bug: create function right after the role is created will cause AccessDeniedExceptionKMS error
+            # A freshly created IAM role can take a while to propagate, and
+            # create_function intermittently fails with "The role defined for the
+            # function cannot be assumed by Lambda" until it does — retry with backoff.
+            for attempt in range(5):
+                try:
+                    lambda_response = lmb.create_function(
+                        FunctionName="GDPatrol",
+                        Runtime=LAMBDA_RUNTIME,
+                        Role=lambda_role_arn,
+                        Handler="lambda_function.lambda_handler",
+                        Code={"ZipFile": open(zipped, "rb").read()},
+                        Timeout=300,
+                        MemorySize=128,
+                        Environment={"Variables": lambda_env},
+                    )
+                    break
+                except lmb.exceptions.ResourceConflictException:
+                    # The function already exists (e.g. a redeploy) — update it in place
+                    # instead of failing, so a stale function never blocks the deploy.
+                    lambda_response = lmb.update_function_code(
+                        FunctionName="GDPatrol",
+                        ZipFile=open(zipped, "rb").read(),
+                    )
+                    # update_function_code leaves the function InProgress for a few
+                    # seconds; update_function_configuration raises ResourceConflict
+                    # if called before it settles.
+                    lmb.get_waiter("function_updated").wait(FunctionName="GDPatrol")
+                    lmb.update_function_configuration(
+                        FunctionName="GDPatrol",
+                        Runtime=LAMBDA_RUNTIME,
+                        Role=lambda_role_arn,
+                        Handler="lambda_function.lambda_handler",
+                        Timeout=300,
+                        MemorySize=128,
+                        Environment={"Variables": lambda_env},
+                    )
+                    break
+                except lmb.exceptions.InvalidParameterValueException as e:
+                    if "cannot be assumed" not in str(e) or attempt == 4:
+                        raise
+                    print("Role not yet assumable in region {}, retrying...".format(str(region)))
+                    sleep(10)
+            target_arn = lambda_response["FunctionArn"]
+            # Stable target Id so put_targets replaces the same target on each redeploy
+            # instead of accumulating toward EventBridge's hard limit of 5 targets/rule.
+            target_id = "GDPatrolTarget"
 
-        # We are adding the trigger to the Lambda function so that it will be invoked every time  a finding is sent over
-        statement_id = str(randrange(10**11, 10**12))
-        lmb.add_permission(
-            FunctionName=lambda_response["FunctionName"],
-            StatementId=statement_id,
-            Action="lambda:InvokeFunction",
-            Principal="events.amazonaws.com",
-            SourceArn=created_rule["RuleArn"],
-        )
-        print("Successfully deployed the GDPatrol lambda function in region {}.".format(str(region)))
-
-        # Create DynamoDB table if not existed
-        dynamodb_client = boto3.client("dynamodb", region_name=region)
-        try:
-            response = dynamodb_client.create_table(
-                AttributeDefinitions=[
-                    {
-                        "AttributeName": "network_acl_id",
-                        "AttributeType": "S",
-                    },
-                    {
-                        "AttributeName": "created_at",
-                        "AttributeType": "S",
-                    },
-                ],
-                KeySchema=[
-                    {
-                        "AttributeName": "network_acl_id",
-                        "KeyType": "HASH",
-                    },
-                    {
-                        "AttributeName": "created_at",
-                        "KeyType": "RANGE",
-                    },
-                ],
-                BillingMode="PAY_PER_REQUEST",
-                TableName="GDPatrol",
+            created_rule = cw_events.put_rule(
+                Name="GDPatrol",
+                EventPattern='{"source":["aws.guardduty"],"detail-type":["GuardDuty Finding"]}',
             )
-        except dynamodb_client.exceptions.ResourceInUseException:
-            pass
-
-        # Create the lock table used by blacklist_ip's acquire_lock/release_lock
-        try:
-            response = dynamodb_client.create_table(
-                AttributeDefinitions=[
-                    {
-                        "AttributeName": "lock_id",
-                        "AttributeType": "S",
-                    },
-                ],
-                KeySchema=[
-                    {
-                        "AttributeName": "lock_id",
-                        "KeyType": "HASH",
-                    },
-                ],
-                BillingMode="PAY_PER_REQUEST",
-                TableName="GDPatrol_lock",
+            cw_events.put_targets(
+                Rule="GDPatrol",
+                Targets=[{"Id": target_id, "Arn": target_arn, "InputPath": "$.detail"}],
             )
-        except dynamodb_client.exceptions.ResourceInUseException:
-            pass
+
+            # Stable StatementId so redeploys don't accumulate duplicate resource-policy
+            # statements toward Lambda's policy-size limit.
+            try:
+                lmb.add_permission(
+                    FunctionName=lambda_response["FunctionName"],
+                    StatementId="GDPatrolEventBridgeInvoke",
+                    Action="lambda:InvokeFunction",
+                    Principal="events.amazonaws.com",
+                    SourceArn=created_rule["RuleArn"],
+                )
+            except lmb.exceptions.ResourceConflictException:
+                # Permission already present from a prior deploy — idempotent.
+                pass
+            print("Successfully deployed the GDPatrol lambda function in region {}.".format(str(region)))
+
+            # Create DynamoDB table if not existed
+            dynamodb_client = boto3.client("dynamodb", region_name=region)
+            try:
+                response = dynamodb_client.create_table(
+                    AttributeDefinitions=[
+                        {
+                            "AttributeName": "network_acl_id",
+                            "AttributeType": "S",
+                        },
+                        {
+                            "AttributeName": "created_at",
+                            "AttributeType": "S",
+                        },
+                    ],
+                    KeySchema=[
+                        {
+                            "AttributeName": "network_acl_id",
+                            "KeyType": "HASH",
+                        },
+                        {
+                            "AttributeName": "created_at",
+                            "KeyType": "RANGE",
+                        },
+                    ],
+                    BillingMode="PAY_PER_REQUEST",
+                    TableName="GDPatrol",
+                )
+            except dynamodb_client.exceptions.ResourceInUseException:
+                pass
+
+            # Create the lock table used by blacklist_ip's acquire_lock/release_lock
+            try:
+                response = dynamodb_client.create_table(
+                    AttributeDefinitions=[
+                        {
+                            "AttributeName": "lock_id",
+                            "AttributeType": "S",
+                        },
+                    ],
+                    KeySchema=[
+                        {
+                            "AttributeName": "lock_id",
+                            "KeyType": "HASH",
+                        },
+                    ],
+                    BillingMode="PAY_PER_REQUEST",
+                    TableName="GDPatrol_lock",
+                )
+            except dynamodb_client.exceptions.ResourceInUseException:
+                pass
+
+            deployed_regions.append(region)
+        except Exception as e:
+            print("Failed to deploy region {}: {}".format(region, e))
+            failed_regions.append(region)
+            continue
 
     remove(zipped)
+
+    print("Deploy summary: {} succeeded, {} failed.".format(len(deployed_regions), len(failed_regions)))
+    if deployed_regions:
+        print("  Succeeded: {}".format(", ".join(deployed_regions)))
+    if failed_regions:
+        print("  Failed: {}".format(", ".join(failed_regions)))
 
 
 if __name__ == "__main__":

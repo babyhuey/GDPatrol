@@ -6,8 +6,6 @@
       "Action": [
         "ec2:RevokeSecurityGroupEgress",
         "ec2:CreateSnapshot",
-        "iam:PutUserPolicy",
-        "iam:DeleteUserPolicy",
         "ec2:DeleteNetworkAclEntry",
         "autoscaling:DetachInstances"
       ],
@@ -16,9 +14,21 @@
         "arn:aws:ec2:*:*:volume/*",
         "arn:aws:ec2:*:*:security-group/*",
         "arn:aws:ec2:*:*:network-acl/*",
-        "arn:aws:iam::*:user/*",
         "arn:aws:autoscaling:*:*:autoScalingGroup:*:autoScalingGroupName/*"
       ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:PutUserPolicy",
+        "iam:DeleteUserPolicy"
+      ],
+      "Resource": "arn:aws:iam::*:user/*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PolicyName": ["BlockAllPolicy", "BlockEC2Policy", "BlockSecurityGroupPolicy"]
+        }
+      }
     },
     {
       "Effect": "Allow",
@@ -26,7 +36,7 @@
         "autoscaling:DescribeAutoScalingInstances",
         "ec2:DescribeInstances",
         "ec2:CreateSecurityGroup",
-        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyNetworkInterfaceAttribute",
         "ec2:CreateNetworkAclEntry",
         "ec2:DescribeNetworkAcls"
       ],
@@ -47,7 +57,10 @@
     {
       "Effect": "Allow",
       "Action": [
-        "dynamodb:*"
+        "dynamodb:Query",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:DeleteItem"
       ],
       "Resource": [
         "arn:aws:dynamodb:*:*:table/GDPatrol",
@@ -57,10 +70,19 @@
     {
       "Effect": "Allow",
       "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/gdpatrol/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
         "bedrock:InvokeModel"
       ],
       "Resource": [
-        "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-sonnet-4-6",
+        "arn:aws:bedrock:*:*:foundation-model/anthropic.claude-sonnet-4-6*",
         "arn:aws:bedrock:*:*:inference-profile/global.anthropic.claude-sonnet-4-6"
       ]
     }

@@ -9,7 +9,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Backdoor:EC2/Spambot",
@@ -19,7 +19,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Backdoor:EC2/XORDDOS",
@@ -29,7 +29,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Behavior:EC2/NetworkPortUnusual",
@@ -54,7 +54,7 @@
           "blacklist_domain",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "PenTest:IAMUser/KaliLinux",
@@ -65,22 +65,22 @@
       },
       {
         "type": "Persistence:IAMUser/NetworkPermissions",
-        "actions": "disable_sg_access",
-        "reliability": 5
+        "actions": ["disable_sg_access"],
+        "reliability": 4
       },
       {
         "type": "Persistence:IAMUser/ResourcePermissions",
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 4
       },
       {
         "type": "Persistence:IAMUser/UserPermissions",
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 4
       },
       {
         "type": "Recon:EC2/PortProbeUnprotectedPort",
@@ -103,42 +103,42 @@
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Recon:IAMUser/MaliciousIPCaller.Custom",
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Recon:IAMUser/NetworkPermissions",
         "actions": [
           "disable_sg_access"
         ],
-        "reliability": 5
+        "reliability": 4
       },
       {
         "type": "Recon:IAMUser/ResourcePermissions",
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 4
       },
       {
         "type": "Recon:IAMUser/TorIPCaller",
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Recon:IAMUser/UserPermissions",
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 4
       },
       {
         "type": "ResourceConsumption:IAMUser/ComputeResources",
@@ -176,7 +176,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/BlackholeTraffic!DNS",
@@ -186,7 +186,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/DGADomainRequest.B",
@@ -196,7 +196,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/DGADomainRequest.C!DNS",
@@ -206,7 +206,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/DNSDataExfiltration",
@@ -216,7 +216,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/DriveBySourceTraffic!DNS",
@@ -226,7 +226,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/DropPoint",
@@ -236,7 +236,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/DropPoint!DNS",
@@ -246,7 +246,7 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "Trojan:EC2/PhishingDomainRequest!DNS",
@@ -256,35 +256,35 @@
           "quarantine_instance",
           "snapshot_instance"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "UnauthorizedAccess:EC2/MaliciousIPCaller.Custom",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "UnauthorizedAccess:EC2/RDPBruteForce",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 8
       },
       {
         "type": "UnauthorizedAccess:EC2/SSHBruteForce",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 10
+        "reliability": 8
       },
       {
         "type": "UnauthorizedAccess:EC2/TorIPCaller",
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "UnauthorizedAccess:IAMUser/ConsoleLogin",
@@ -305,7 +305,7 @@
         "actions": [
           "disable_account"
         ],
-        "reliability": 5
+        "reliability": 8
       },
       {
         "type": "UnauthorizedAccess:IAMUser/MaliciousIPCaller",
@@ -313,7 +313,7 @@
           "disable_account",
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 8
       },
       {
         "type": "UnauthorizedAccess:IAMUser/MaliciousIPCaller.Custom",
@@ -321,7 +321,7 @@
           "disable_account",
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 8
       },
       {
         "type": "UnauthorizedAccess:IAMUser/TorIPCaller",
@@ -329,7 +329,7 @@
           "disable_account",
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 7
       },
       {
         "type": "UnauthorizedAccess:IAMUser/UnusualASNCaller",
@@ -378,7 +378,7 @@
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 6
       },
       {
         "type": "CredentialAccess:RDS/TorIPCaller.SuccessfulLogin",
@@ -399,7 +399,7 @@
         "actions": [
           "blacklist_ip"
         ],
-        "reliability": 5
+        "reliability": 6
       },
       {
         "type": "Discovery:S3/MaliciousIPCaller",
