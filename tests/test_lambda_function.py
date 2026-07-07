@@ -819,9 +819,7 @@ def test_delete_oldest_acl_entry_all_rows_stale_falls_back_to_aws(mock_ec2, mock
     mock_dynamo.query.return_value = {
         "Items": [{"network_acl_id": {"S": "acl-123"}, "created_at": {"S": "1000.0"}, "rule_number": {"S": "2"}}]
     }
-    not_found = ClientError(
-        {"Error": {"Code": "InvalidNetworkAclEntry.NotFound", "Message": "not found"}}, "DeleteNetworkAclEntry"
-    )
+    not_found = ClientError({"Error": {"Code": "InvalidNetworkAclEntry.NotFound", "Message": "not found"}}, "DeleteNetworkAclEntry")
     mock_ec2.delete_network_acl_entry.side_effect = [not_found, None]
     mock_ec2.describe_network_acls.return_value = {
         "NetworkAcls": [

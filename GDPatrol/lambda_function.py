@@ -34,6 +34,7 @@ def get_slack_web_hook_url():
             return None
     return _slack_web_hook_url
 
+
 # Use environment variables for table names
 GD_PATROL_TABLE = os.environ.get("GD_PATROL_TABLE", "GDPatrol")
 GD_PATROL_LOCK_TABLE = os.environ.get("GD_PATROL_LOCK_TABLE", "GDPatrol_lock")
