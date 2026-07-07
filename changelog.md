@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- GuardDuty finding-type coverage for S3 Protection, Lambda Protection, EC2/IAM anomalous-behavior and reputation findings, Runtime Monitoring, and EC2 Malware Protection (68 new playbook entries)
+- Kubernetes/EKS audit-log finding coverage with a new KUBERNETES_API_CALL IP-extraction branch (15 playbook entries)
 - Integration with AWS Bedrock Claude Sonnet for enhanced Slack message processing
 - Comprehensive test suite using pytest for lambda function
 - Mock AWS services using moto for testing

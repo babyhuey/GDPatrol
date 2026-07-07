@@ -100,6 +100,9 @@ def summarize_event(event: Dict[str, Any]) -> Dict[str, Any]:
     elif action_type == "RDS_LOGIN_ATTEMPT":
         rds_action = action.get("rdsLoginAttemptAction", {})
         summary["source_ip"] = rds_action.get("remoteIpDetails", {}).get("ipAddressV4")
+    elif action_type == "KUBERNETES_API_CALL":
+        k8s_action = action.get("kubernetesApiCallAction", {})
+        summary["source_ip"] = k8s_action.get("remoteIpDetails", {}).get("ipAddressV4")
 
     # Target resource
     resource = event.get("resource", {})
@@ -866,6 +869,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
             ip_address = port_probe_details[0].get("remoteIpDetails", {}).get("ipAddressV4")
     elif action_type == "RDS_LOGIN_ATTEMPT":
         ip_address = event["service"]["action"]["rdsLoginAttemptAction"].get("remoteIpDetails", {}).get("ipAddressV4")
+    elif action_type == "KUBERNETES_API_CALL":
+        ip_address = event["service"]["action"]["kubernetesApiCallAction"].get("remoteIpDetails", {}).get("ipAddressV4")
 
     successful_actions = 0
     total_config_actions = len(config_actions)

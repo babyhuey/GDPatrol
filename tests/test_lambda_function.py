@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import GDPatrol.lambda_function as lambda_module
 from GDPatrol.lambda_function import (
+    summarize_event,
     enhance_message_with_claude,
     publish_message,
     create_network_acl_entry,
@@ -1770,6 +1771,130 @@ def test_lambda_handler_iam_finding(monkeypatch):
         mock_disable.return_value = True
         lambda_handler(event, None)
         mock_disable.assert_called_once_with("baduser")
+
+
+# --- Real config.json integrity ---
+
+# Pre-existing entries that use disable_sg_access/disable_ec2_access — implemented and dispatched in
+# lambda_handler, but outside the 6 actions this coverage work adds new entries with. Left untouched.
+LEGACY_NON_STANDARD_ACTION_TYPES = {
+    "Persistence:IAMUser/NetworkPermissions",
+    "Recon:IAMUser/NetworkPermissions",
+    "ResourceConsumption:IAMUser/ComputeResources",
+}
+
+
+def test_real_config_json_integrity(monkeypatch):
+    """The real GDPatrol/config.json must be valid JSON, have no duplicate finding types, and every
+    newly-added entry must use only the 6 actions lambda_handler actually dispatches. A representative
+    sample of the new finding types must resolve via the Config class to the expected action list."""
+    real_config_path = Path(__file__).parent.parent / "GDPatrol" / "config.json"
+    data = json.loads(real_config_path.read_text())
+
+    playbook = data["playbooks"]["playbook"]
+    types = [p["type"] for p in playbook]
+    assert len(types) == len(set(types)), "duplicate finding types in config.json"
+
+    valid_actions = {
+        "blacklist_ip",
+        "blacklist_domain",
+        "quarantine_instance",
+        "snapshot_instance",
+        "asg_detach_instance",
+        "disable_account",
+    }
+    for p in playbook:
+        if p["type"] in LEGACY_NON_STANDARD_ACTION_TYPES:
+            continue
+        actions = p["actions"] if isinstance(p["actions"], list) else [p["actions"]]
+        for action in actions:
+            assert action in valid_actions, f"unimplemented action {action!r} for finding type {p['type']!r}"
+
+    by_type = {p["type"]: p for p in playbook}
+    expected_actions_by_type = {
+        "Discovery:S3/MaliciousIPCaller": ["blacklist_ip"],
+        "CredentialAccess:IAMUser/CompromisedCredentials": ["disable_account", "blacklist_ip"],
+        "Backdoor:EC2/DenialOfService.Tcp": ["quarantine_instance", "snapshot_instance", "asg_detach_instance"],
+        "Backdoor:Lambda/C&CActivity.B": ["blacklist_ip"],
+        "Trojan:Runtime/DGADomainRequest.C!DNS": ["blacklist_domain"],
+        "Execution:EC2/MaliciousFile": ["quarantine_instance", "snapshot_instance", "asg_detach_instance"],
+        "CredentialAccess:Kubernetes/MaliciousIPCaller": ["blacklist_ip"],
+    }
+    for finding_type, expected in expected_actions_by_type.items():
+        assert finding_type in by_type, f"missing finding type {finding_type!r}"
+
+    # Config.__init__ opens "config.json" relatively — chdir into GDPatrol/ so it reads the real file
+    # (not mocked), matching the layout of the deployed Lambda package.
+    monkeypatch.chdir(real_config_path.parent)
+    for finding_type, expected in expected_actions_by_type.items():
+        config = Config(finding_type)
+        assert config.get_actions() == expected
+
+
+# --- KUBERNETES_API_CALL extraction ---
+
+
+def test_summarize_event_kubernetes_api_call():
+    """summarize_event must extract the remote IP for KUBERNETES_API_CALL findings."""
+    event = {
+        "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+        "severity": 8,
+        "service": {
+            "action": {
+                "actionType": "KUBERNETES_API_CALL",
+                "kubernetesApiCallAction": {
+                    "remoteIpDetails": {"ipAddressV4": "198.51.100.42"},
+                },
+            }
+        },
+    }
+    summary = summarize_event(event)
+    assert summary["source_ip"] == "198.51.100.42"
+
+
+def test_lambda_handler_kubernetes_finding(monkeypatch):
+    """Test lambda handler extracts the IP from a KUBERNETES_API_CALL event and dispatches blacklist_ip."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-k8s-id",
+        "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+        "severity": 8,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {"resourceType": "Kubernetes"},
+        "service": {
+            "action": {
+                "actionType": "KUBERNETES_API_CALL",
+                "kubernetesApiCallAction": {
+                    "remoteIpDetails": {"ipAddressV4": "198.51.100.42"},
+                },
+            },
+            "count": 1,
+            "eventFirstSeen": "2024-01-01T00:00:00Z",
+            "eventLastSeen": "2024-01-01T00:00:00Z",
+        },
+        "description": "Kubernetes API call from known malicious IP",
+    }
+
+    test_config_path = Path(__file__).parent / "test_config.json"
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message"),
+        patch("GDPatrol.lambda_function.blacklist_ip") as mock_blacklist,
+    ):
+        config_data = json.loads(test_config_path.read_text())
+        config_data["playbooks"]["playbook"].append(
+            {
+                "type": "CredentialAccess:Kubernetes/MaliciousIPCaller",
+                "actions": ["blacklist_ip"],
+                "reliability": 5,
+            }
+        )
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        mock_blacklist.return_value = True
+        lambda_handler(event, None)
+        mock_blacklist.assert_called_once_with("198.51.100.42")
 
 
 def test_lambda_handler_fractional_severity_crosses_gate(monkeypatch):
