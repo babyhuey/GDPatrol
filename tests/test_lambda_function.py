@@ -1897,6 +1897,52 @@ def test_lambda_handler_kubernetes_finding(monkeypatch):
         mock_blacklist.assert_called_once_with("198.51.100.42")
 
 
+def test_lambda_handler_terminated_instance_without_enis(monkeypatch):
+    """A finding on a terminated instance (networkInterfaces: []) must not crash the handler —
+    the IP action must still run and the alert must still publish (no VPC just means no quarantine)."""
+    monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
+
+    event = {
+        "id": "test-terminated",
+        "type": "Recon:EC2/PortProbeUnprotectedPort",
+        "severity": 8,
+        "accountId": "123456789012",
+        "region": "us-east-1",
+        "resource": {
+            "resourceType": "Instance",
+            "instanceDetails": {
+                "instanceId": "i-00ae66540c5ef9603",
+                "instanceState": "terminated",
+                "networkInterfaces": [],
+            },
+        },
+        "service": {
+            "action": {
+                "actionType": "PORT_PROBE",
+                "portProbeAction": {
+                    "portProbeDetails": [{"remoteIpDetails": {"ipAddressV4": "185.180.141.38"}}],
+                },
+            },
+            "count": 1,
+            "eventFirstSeen": "x",
+            "eventLastSeen": "y",
+        },
+        "description": "Port probe on a terminated instance",
+    }
+    config_data = {
+        "playbooks": {"playbook": [{"type": "Recon:EC2/PortProbeUnprotectedPort", "actions": ["blacklist_ip"], "reliability": 5}]}
+    }
+    with (
+        patch("builtins.open", MagicMock()) as mock_open,
+        patch("GDPatrol.lambda_function.publish_message") as mock_publish,
+        patch("GDPatrol.lambda_function.blacklist_ip", return_value=True) as mock_blacklist,
+    ):
+        mock_open.return_value.__enter__.return_value.read.return_value = json.dumps(config_data)
+        lambda_handler(event, None)  # must not raise IndexError
+        mock_blacklist.assert_called_once_with("185.180.141.38")
+    mock_publish.assert_called_once()
+
+
 def test_lambda_handler_fractional_severity_crosses_gate(monkeypatch):
     """A fractional severity like 5.5 must not be truncated to 5, which would under-count the reliability gate."""
     monkeypatch.setenv("SLACK_WEB_HOOK_URL", "https://hooks.slack.com/services/test")
