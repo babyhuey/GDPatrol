@@ -850,7 +850,9 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> None:
     if resource_type == "Instance":
         instance = event["resource"]["instanceDetails"]
         instance_id = instance["instanceId"]
-        vpc_id = instance["networkInterfaces"][0]["vpcId"]
+        # A terminated instance has no ENIs; leave vpc_id None (skips quarantine) rather than crash.
+        network_interfaces = instance.get("networkInterfaces") or []
+        vpc_id = network_interfaces[0]["vpcId"] if network_interfaces else None
     elif resource_type == "AccessKey":
         username = event["resource"]["accessKeyDetails"]["userName"]
 
