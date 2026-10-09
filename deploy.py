@@ -200,6 +200,16 @@ def run(slack_web_hook_url=None):
                 Rule="GDPatrol",
                 Targets=[{"Id": target_id, "Arn": target_arn, "InputPath": "$.detail"}],
             )
+            # Deploys before the stable Id left randomly-named targets on this rule; each one
+            # pointing at GDPatrol invokes it again for every finding, racing the NACL updates.
+            stale_target_ids = [
+                target["Id"]
+                for target in cw_events.list_targets_by_rule(Rule="GDPatrol")["Targets"]
+                if target["Id"] != target_id and target["Arn"] == target_arn
+            ]
+            if stale_target_ids:
+                cw_events.remove_targets(Rule="GDPatrol", Ids=stale_target_ids)
+                print("Removed duplicate GDPatrol targets {} in region {}.".format(", ".join(stale_target_ids), region))
 
             # Stable StatementId so redeploys don't accumulate duplicate resource-policy
             # statements toward Lambda's policy-size limit.
