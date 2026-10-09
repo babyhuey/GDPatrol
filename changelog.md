@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Enhanced error handling and logging
 
 ### Fixed
+- `deploy.py` now removes leftover randomly-named EventBridge targets that point at GDPatrol; they made every finding invoke the Lambda twice, and the twin invocations raced on NACL rule numbers
 - IP address validation logic
 - Environment variable handling in tests
 - Import issues with moto library
