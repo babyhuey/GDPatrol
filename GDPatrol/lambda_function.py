@@ -152,20 +152,22 @@ Slack has no heading syntax — use a short bold line instead of ## headings."""
 
         response = bedrock_client.invoke_model(
             # On-demand invocation requires an inference profile ID, not the bare model ID
-            modelId="global.anthropic.claude-sonnet-4-6",
+            modelId="global.anthropic.claude-sonnet-5-5",
             body=json.dumps(
                 {
                     "anthropic_version": "bedrock-2023-05-31",
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1000,
-                    # Claude 4.x rejects requests that set both temperature and top_p
-                    "temperature": 0.7,
+                    # Thinking is on by default and counts toward max_tokens
+                    "max_tokens": 4000,
+                    # Sonnet 5.5 rejects non-default temperature/top_p/top_k; tune with effort instead
+                    "output_config": {"effort": "low"},
                 }
             ),
         )
 
         response_body = json.loads(response.get("body").read())
-        enhanced_message = response_body["content"][0]["text"]
+        # Responses can lead with a thinking block, so read the text block by type
+        enhanced_message = next(block["text"] for block in response_body["content"] if block["type"] == "text")
 
         # Add the enhanced message to the description
         message_data["attachments"][0]["fields"].append({"title": "AI Analysis", "value": enhanced_message, "short": False})

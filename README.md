@@ -127,7 +127,7 @@ SSM:
 Put Parameter
 
 Bedrock:
-InvokeModel (anthropic.claude-sonnet-4-6)
+InvokeModel (anthropic.claude-sonnet-5-5)
 
 DynamoDB:
 CreateTable, PutItem, DeleteItem, Query, GetItem, UpdateItem

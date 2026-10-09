@@ -98,16 +98,26 @@ def test_enhance_message_with_claude(mock_bedrock):
     test_message = {"attachments": [{"fields": [{"title": "Test", "value": "Test Value"}]}]}
 
     mock_bedrock.invoke_model.return_value = {
-        "body": MagicMock(read=lambda: json.dumps({"content": [{"text": "This is a security analysis."}]}).encode())
+        "body": MagicMock(
+            read=lambda: json.dumps(
+                {
+                    "content": [
+                        {"type": "thinking", "thinking": "", "signature": "sig"},
+                        {"type": "text", "text": "This is a security analysis."},
+                    ]
+                }
+            ).encode()
+        )
     }
 
     result = enhance_message_with_claude(test_message)
 
     mock_bedrock.invoke_model.assert_called_once()
-    assert mock_bedrock.invoke_model.call_args[1]["modelId"] == "global.anthropic.claude-sonnet-4-6"
+    assert mock_bedrock.invoke_model.call_args[1]["modelId"] == "global.anthropic.claude-sonnet-5-5"
     call_body = json.loads(mock_bedrock.invoke_model.call_args[1]["body"])
     assert call_body["anthropic_version"] == "bedrock-2023-05-31"
-    assert "top_p" not in call_body  # temperature and top_p are mutually exclusive on Claude 4.x
+    # Sonnet 5.5 returns 400 for any non-default sampling parameter
+    assert not {"temperature", "top_p", "top_k"} & call_body.keys()
     assert len(call_body["messages"]) == 1
     assert call_body["messages"][0]["role"] == "user"
     # Prompt is status-aware so the AI recommends follow-up, not actions GDPatrol already took.

@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Message formatting
 
 ### Changed
+- Switched AI Analysis from Claude Sonnet 4.6 to Sonnet 5.5 (`global.anthropic.claude-sonnet-5-5`) at low effort; dropped `temperature`, which Sonnet 5.5 rejects, and read the reply by content-block type since responses can start with a thinking block
 - Updated lambda function to use AWS Bedrock for message enhancement
 - Improved message formatting with better structure and readability
 - Enhanced error handling and logging
