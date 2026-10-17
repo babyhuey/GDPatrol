@@ -191,19 +191,15 @@ def create_network_acl_entry(ip_address: str, nacl_id: str, rule_number: int) ->
     """
     Create a network ACL entry to block the specified IP address.
     """
-    try:
-        ec2_client.create_network_acl_entry(
-            CidrBlock=f"{ip_address}/32",
-            Egress=False,
-            NetworkAclId=nacl_id,
-            Protocol="-1",
-            RuleAction="deny",
-            RuleNumber=rule_number,
-        )
-        logger.info(f"Created network_acl rule_number = {rule_number} for {nacl_id}")
-    except Exception as error:
-        logger.error(f"Error creating network_acl entry: {error}")
-        raise
+    ec2_client.create_network_acl_entry(
+        CidrBlock=f"{ip_address}/32",
+        Egress=False,
+        NetworkAclId=nacl_id,
+        Protocol="-1",
+        RuleAction="deny",
+        RuleNumber=rule_number,
+    )
+    logger.info(f"Created network_acl rule_number = {rule_number} for {nacl_id}")
 
 
 def _next_free_ingress_deny_rule_number(entries: List[Dict[str, Any]]) -> int | None:
@@ -511,43 +507,38 @@ def blacklist_ip(ip_address: str, lock_table_name: str = None, lock_id: str = No
             except Exception as error:
                 logger.info(f"INFO: {error}")
                 if "NetworkAclEntryLimitExceeded" in str(error):
+                    logger.info(f"Network ACL limit exceeded for {nacl['NetworkAclId']}, attempting to delete oldest entry")
                     try:
-                        logger.info(f"Network ACL limit exceeded for {nacl['NetworkAclId']}, attempting to delete oldest entry")
                         delete_oldest_acl_entry(nacl["NetworkAclId"])
-                        # Retry creating the entry after deleting the oldest one
-                        _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], target_rule_number)
-                        logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} after deleting oldest entry")
-                        blocked_count += 1
-                    except Exception as retry_error:
-                        logger.error(f"Failed to create entry after deleting oldest: {retry_error}")
-                        # Try the next NACL
+                    except Exception as delete_error:
+                        logger.error(f"Failed to delete oldest entry in {nacl['NetworkAclId']}: {delete_error}")
                         continue
                 elif "NetworkAclEntryAlreadyExists" in str(error):
-                    # Our snapshot of the NACL was stale (a concurrent mutation took this number);
-                    # retry with a freshly-computed free number instead of failing outright.
                     logger.warning(f"Rule number {target_rule_number} already exists in {nacl['NetworkAclId']}; retrying with another")
-                    retried_successfully = False
-                    for _ in range(3):
-                        refreshed = ec2_client.describe_network_acls(NetworkAclIds=[nacl["NetworkAclId"]])["NetworkAcls"][0]
-                        retry_rule_number = _next_free_ingress_deny_rule_number(refreshed["Entries"])
-                        if retry_rule_number is None:
-                            break
-                        try:
-                            _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], retry_rule_number)
-                            logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} at retried rule {retry_rule_number}")
-                            blocked_count += 1
-                            retried_successfully = True
-                            break
-                        except Exception as retry_error:
-                            if "NetworkAclEntryAlreadyExists" not in str(retry_error):
-                                logger.error(f"Failed to create entry at retried rule number: {retry_error}")
-                                break
-                    if not retried_successfully:
-                        logger.error(f"Could not blacklist {ip_address} in NACL {nacl['NetworkAclId']}: no free rule number available")
-                        continue
                 else:
                     logger.error(f"Error creating network_acl entry: {error}")
                     continue
+
+                # Our snapshot of the NACL is stale (the eviction above, or a concurrent mutation,
+                # changed it), so target_rule_number may be taken; retry with a freshly-computed one.
+                retried_successfully = False
+                for _ in range(3):
+                    refreshed = ec2_client.describe_network_acls(NetworkAclIds=[nacl["NetworkAclId"]])["NetworkAcls"][0]
+                    retry_rule_number = _next_free_ingress_deny_rule_number(refreshed["Entries"])
+                    if retry_rule_number is None:
+                        break
+                    try:
+                        _create_and_track_deny_rule(ip_address, nacl["NetworkAclId"], retry_rule_number)
+                        logger.info(f"Blacklisted IP {ip_address} in NACL {nacl['NetworkAclId']} at retried rule {retry_rule_number}")
+                        blocked_count += 1
+                        retried_successfully = True
+                        break
+                    except Exception as retry_error:
+                        if "NetworkAclEntryAlreadyExists" not in str(retry_error):
+                            logger.error(f"Failed to create entry at retried rule number: {retry_error}")
+                            break
+                if not retried_successfully:
+                    logger.error(f"Could not blacklist {ip_address} in NACL {nacl['NetworkAclId']}: no free rule number available")
 
         if nacls and blocked_count == len(nacls):
             logger.info(f"Successfully blacklisted IP: {ip_address} in {blocked_count} NACL(s)")
