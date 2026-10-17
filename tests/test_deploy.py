@@ -166,6 +166,36 @@ def test_slack_webhook_param_not_written_when_unset(deploy_harness, monkeypatch,
     assert "WARNING: SLACK_WEB_HOOK_URL is not set" in capsys.readouterr().out
 
 
+def test_duplicate_targets_for_gdpatrol_are_removed(deploy_harness):
+    """Leftover randomly-named targets pointing at GDPatrol double-invoke it per finding;
+    deploy prunes them but leaves the stable target and anything aimed elsewhere."""
+    region = deploy_harness.regions[0]
+    function_arn = "arn:aws:lambda:{}:123456789012:function:GDPatrol".format(region)
+    events = deploy_harness.clients[("events", region)]
+    events.list_targets_by_rule.return_value = {
+        "Targets": [
+            {"Id": "GDPatrolTarget", "Arn": function_arn},
+            {"Id": "Id396147558817", "Arn": function_arn},
+            {"Id": "SomethingElse", "Arn": "arn:aws:sns:{}:123456789012:other".format(region)},
+        ]
+    }
+
+    deploy.run(slack_web_hook_url="https://hooks.slack.com/services/test")
+
+    events.remove_targets.assert_called_once_with(Rule="GDPatrol", Ids=["Id396147558817"])
+
+
+def test_no_remove_call_when_only_stable_target(deploy_harness):
+    region = deploy_harness.regions[0]
+    function_arn = "arn:aws:lambda:{}:123456789012:function:GDPatrol".format(region)
+    events = deploy_harness.clients[("events", region)]
+    events.list_targets_by_rule.return_value = {"Targets": [{"Id": "GDPatrolTarget", "Arn": function_arn}]}
+
+    deploy.run(slack_web_hook_url="https://hooks.slack.com/services/test")
+
+    assert not events.remove_targets.called
+
+
 def test_create_conflict_falls_back_to_update(deploy_harness):
     region = deploy_harness.regions[0]
     lmb = deploy_harness.clients[("lambda", region)]
