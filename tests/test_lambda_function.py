@@ -620,6 +620,62 @@ def test_blacklist_ip_retries_on_already_exists(mock_ec2, mock_next_free, mock_c
     assert mock_create_entry.call_args_list[1].args[2] == 98
 
 
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.delete_oldest_acl_entry")
+@patch("GDPatrol.lambda_function.create_network_acl_entry")
+@patch("GDPatrol.lambda_function._next_free_ingress_deny_rule_number")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_blacklist_ip_limit_exceeded_retries_with_fresh_rule_number(
+    mock_ec2, mock_next_free, mock_create_entry, mock_delete_oldest, mock_dynamo
+):
+    """After evicting the oldest entry on NetworkAclEntryLimitExceeded, the retry must use a rule
+    number recomputed from a fresh NACL read, not the pre-eviction snapshot's number."""
+    from botocore.exceptions import ClientError
+
+    nacl = {"NetworkAclId": "acl-1", "Entries": []}
+    mock_ec2.get_paginator.return_value.paginate.return_value = [{"NetworkAcls": [nacl]}]
+    mock_ec2.describe_network_acls.return_value = {"NetworkAcls": [nacl]}
+    mock_next_free.side_effect = [99, 98]
+    mock_create_entry.side_effect = [
+        ClientError({"Error": {"Code": "NetworkAclEntryLimitExceeded", "Message": "x"}}, "CreateNetworkAclEntry"),
+        None,
+    ]
+    mock_dynamo.exceptions = MagicMock()
+
+    with patch("GDPatrol.lambda_function.acquire_lock"), patch("GDPatrol.lambda_function.release_lock"):
+        result = blacklist_ip("10.0.0.1")
+
+    assert result is True
+    mock_delete_oldest.assert_called_once_with("acl-1")
+    mock_ec2.describe_network_acls.assert_called_once_with(NetworkAclIds=["acl-1"])
+    assert [c.args[2] for c in mock_create_entry.call_args_list] == [99, 98]
+
+
+@patch("GDPatrol.lambda_function.dynamodb_client")
+@patch("GDPatrol.lambda_function.delete_oldest_acl_entry")
+@patch("GDPatrol.lambda_function.ec2_client")
+def test_blacklist_ip_limit_exceeded_does_not_log_error(mock_ec2, mock_delete_oldest, mock_dynamo, caplog):
+    """Hitting the NACL rule limit is the normal path once NACLs are full; a block that succeeds
+    after evicting the oldest entry must not emit any ERROR log."""
+    from botocore.exceptions import ClientError
+
+    nacl = {"NetworkAclId": "acl-1", "Entries": []}
+    mock_ec2.get_paginator.return_value.paginate.return_value = [{"NetworkAcls": [nacl]}]
+    mock_ec2.describe_network_acls.return_value = {"NetworkAcls": [nacl]}
+    mock_ec2.create_network_acl_entry.side_effect = [
+        ClientError({"Error": {"Code": "NetworkAclEntryLimitExceeded", "Message": "x"}}, "CreateNetworkAclEntry"),
+        None,
+    ]
+    mock_dynamo.exceptions = MagicMock()
+
+    with patch("GDPatrol.lambda_function.acquire_lock"), patch("GDPatrol.lambda_function.release_lock"):
+        with caplog.at_level(logging.INFO):
+            result = blacklist_ip("10.0.0.1")
+
+    assert result is True
+    assert [r.message for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
 # --- _next_free_ingress_deny_rule_number tests ---
 
 

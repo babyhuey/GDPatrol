@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Import issues with moto library
 - Configuration file handling in tests
 - Removed dependency on a pre-existing "slack" Lambda Layer (tied to the original account); deploy.py now vendors dependencies directly into the deployment zip via uv
+- Blacklisting after a NetworkAclEntryLimitExceeded eviction now retries with a rule number recomputed from a fresh NACL read instead of the pre-eviction one, and shares the NetworkAclEntryAlreadyExists retry loop
+- Hitting the NACL rule limit no longer logs at ERROR on every successful block; `create_network_acl_entry` leaves logging to its caller, which still logs real failures at ERROR
 
 ### Security & Reliability Improvements
 - Aggressive NACL cleanup: when NACL deny rules approach the AWS limit, automatically delete all but the 10 most recent deny rules before adding a new one
